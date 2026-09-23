@@ -1,0 +1,22 @@
+/*
+ * SPDX-License-Identifier: BSD-2-Clause
+ * linuxkpi clock API stub for FreeBSD.
+ * Part of the planck-113 SDIO LinuxKPI port.
+ */
+#ifndef _LINUXKPI_LINUX_CLK_H
+#define _LINUXKPI_LINUX_CLK_H
+
+#include <linux/types.h>
+#include <linux/err.h>
+#include <linux/device.h>
+
+struct clk;
+
+static inline struct clk *devm_clk_get_optional_enabled_with_rate(
+    struct device *dev, const char *id, unsigned long default_rate)
+{
+    (void)dev; (void)id; (void)default_rate;
+    return NULL;
+}
+
+#endif /* _LINUXKPI_LINUX_CLK_H */

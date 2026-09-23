@@ -1,0 +1,217 @@
+diff --git a/sys/compat/linuxkpi/common/include/net/cfg80211.h b/sys/compat/linuxkpi/common/include/net/cfg80211.h
+index dedf687d6..d0bb788dd 100644
+--- a/sys/compat/linuxkpi/common/include/net/cfg80211.h
++++ b/sys/compat/linuxkpi/common/include/net/cfg80211.h
+@@ -1853,7 +1853,20 @@ static __inline void
+ cfg80211_connect_done(struct net_device *ndev,
+     struct cfg80211_connect_resp_params *conn_params, gfp_t gfp)
+ {
+-	TODO();
++	/*
++	 * Real nl80211 hands this to a netlink socket for wpa_supplicant to
++	 * read; we have neither, so at minimum surface the result where it
++	 * can be observed (dmesg) and reflect it in the one piece of kernel
++	 * state anything else can see: carrier state on the ifnet.
++	 */
++	if (conn_params == NULL)
++		return;
++	printf("cfg80211_connect_done: %s status=%d\n", ndev->name,
++	    conn_params->status);
++	if (conn_params->status == 0)
++		netif_carrier_on(ndev);
++	else
++		netif_carrier_off(ndev);
+ }
+ 
+ static __inline void
+@@ -1866,7 +1879,9 @@ static __inline void
+ cfg80211_disconnected(struct net_device *ndev, uint16_t reason,
+     void *p, int x, bool locally_generated, gfp_t gfp)
+ {
+-	TODO();
++	printf("cfg80211_disconnected: %s reason=%u locally_generated=%d\n",
++	    ndev->name, (unsigned int)reason, locally_generated);
++	netif_carrier_off(ndev);
+ }
+ 
+ static __inline int
+diff --git a/sys/compat/linuxkpi/common/src/linux_80211.c b/sys/compat/linuxkpi/common/src/linux_80211.c
+index b9528295a..fdd7f5ba6 100644
+--- a/sys/compat/linuxkpi/common/src/linux_80211.c
++++ b/sys/compat/linuxkpi/common/src/linux_80211.c
+@@ -119,6 +119,175 @@ SYSCTL_BOOL(_compat_linuxkpi_80211, OID_AUTO, tkip, CTLFLAG_RDTUN,
+     &lkpi_hwcrypto_tkip, 0, "Enable LinuxKPI 802.11 TKIP crypto offload");
+ #endif
+ 
++/* -------------------------------------------------------------------------- */
++/*
++ * Minimal, direct fullmac cfg80211 connect trigger.
++ *
++ * FreeBSD has no netlink/nl80211, which is what a real wpa_supplicant uses
++ * on Linux to drive a fullmac driver's cfg80211_ops (scan/connect/disconnect
++ * all run inside the firmware for a fullmac chip like brcmfmac -- the host
++ * side only needs to hand it an SSID and, for WPA2-PSK, the pre-derived
++ * 256-bit PMK).  Rather than emulate nl80211 (a much bigger project), this
++ * exposes exactly the one operation actually needed to join a network:
++ * stage an SSID/PMK/privacy setting via sysctl, then write the target
++ * interface's name to connect_go to invoke the driver's own
++ * cfg80211_ops->connect() directly.
++ *
++ * The PMK must already be derived (PBKDF2-HMAC-SHA1, SSID as salt, 4096
++ * iterations, RFC 2898/IEEE 802.11-2020 J.4) -- on purpose: that derivation
++ * happens in userspace (see microkernel/wpa_psk.py in this project), the
++ * same way wpa_supplicant does it on Linux before ever handing a PMK to the
++ * kernel, so a WiFi passphrase never has to pass through this sysctl or be
++ * typed anywhere the kernel builder can see it.
++ */
++
++#define	LKPI_WLAN_CIPHER_SUITE_CCMP	0x000FAC04	/* IEEE 802.11-2020 Table 9-133 */
++#define	LKPI_WLAN_AKM_SUITE_PSK		0x000FAC02	/* IEEE 802.11-2020 Table 9-134 */
++
++static char lkpi_connect_ssid[33];
++static char lkpi_connect_pmk_hex[65];		/* 64 hex chars (32-byte PMK) or empty */
++static int lkpi_connect_privacy;
++
++SYSCTL_STRING(_compat_linuxkpi_80211, OID_AUTO, connect_ssid, CTLFLAG_RW,
++    lkpi_connect_ssid, sizeof(lkpi_connect_ssid),
++    "SSID to join on the next write to connect_go");
++SYSCTL_STRING(_compat_linuxkpi_80211, OID_AUTO, connect_pmk, CTLFLAG_RW,
++    lkpi_connect_pmk_hex, sizeof(lkpi_connect_pmk_hex),
++    "64 hex chars = pre-derived 32-byte WPA2-PSK PMK (see wpa_psk.py); "
++    "leave empty for an open network");
++SYSCTL_INT(_compat_linuxkpi_80211, OID_AUTO, connect_privacy, CTLFLAG_RW,
++    &lkpi_connect_privacy, 0,
++    "1 if the target AP is WPA2-PSK (uses connect_pmk), 0 for open");
++
++static int
++lkpi_hexnibble(char c)
++{
++
++	if (c >= '0' && c <= '9')
++		return (c - '0');
++	if (c >= 'a' && c <= 'f')
++		return (c - 'a' + 10);
++	if (c >= 'A' && c <= 'F')
++		return (c - 'A' + 10);
++	return (-1);
++}
++
++static bool
++lkpi_hexdecode32(const char *hex, uint8_t *out)
++{
++	int i, hi, lo;
++
++	if (strlen(hex) != 64)
++		return (false);
++	for (i = 0; i < 32; i++) {
++		hi = lkpi_hexnibble(hex[2 * i]);
++		lo = lkpi_hexnibble(hex[2 * i + 1]);
++		if (hi < 0 || lo < 0)
++			return (false);
++		out[i] = (hi << 4) | lo;
++	}
++	return (true);
++}
++
++static int
++lkpi_connect_by_name(const char *ifname)
++{
++	static const uint32_t ciphers[] = { LKPI_WLAN_CIPHER_SUITE_CCMP };
++	static const uint32_t akms[] = { LKPI_WLAN_AKM_SUITE_PSK };
++	struct ifnet *ifp;
++	struct net_device *ndev;
++	struct wireless_dev *wdev;
++	struct wiphy *wiphy;
++	struct lkpi_wiphy *lwiphy;
++	struct cfg80211_connect_params sme;
++	uint8_t pmk[32];
++	int error;
++
++	CURVNET_SET(vnet0);
++	ifp = ifunit_ref(ifname);
++	CURVNET_RESTORE();
++	if (ifp == NULL)
++		return (ENOENT);
++
++	ndev = if_getsoftc(ifp);
++	if (ndev == NULL || ndev->ieee80211_ptr == NULL) {
++		if_rele(ifp);
++		return (ENXIO);
++	}
++	wdev = ndev->ieee80211_ptr;
++	wiphy = wdev->wiphy;
++	if (wiphy == NULL) {
++		if_rele(ifp);
++		return (ENXIO);
++	}
++	lwiphy = WIPHY_TO_LWIPHY(wiphy);
++	if (lwiphy->ops == NULL || lwiphy->ops->connect == NULL) {
++		if_rele(ifp);
++		return (EOPNOTSUPP);
++	}
++
++	memset(&sme, 0, sizeof(sme));
++	sme.ssid = lkpi_connect_ssid;
++	sme.ssid_len = strnlen(lkpi_connect_ssid, sizeof(lkpi_connect_ssid));
++	sme.auth_type = NL80211_AUTHTYPE_OPEN_SYSTEM;
++	if (sme.ssid_len == 0) {
++		if_rele(ifp);
++		return (EINVAL);
++	}
++
++	/*
++	 * brcmf_set_wsec_mode() reads crypto.ciphers_pairwise[0]
++	 * unconditionally at the end of the function (to cache it in the
++	 * connection profile) even when n_ciphers_pairwise is 0 -- it never
++	 * checks the count before that particular read, only before the
++	 * switch a few lines above it.  A real wpa_supplicant/cfg80211 stack
++	 * apparently never leaves this pointer NULL even for an open
++	 * network; we must not either, or this is a guaranteed NULL deref
++	 * (confirmed on hardware: panic in brcmf_set_wsec_mode via
++	 * brcmf_cfg80211_connect, FAR 0x0). n_ciphers_pairwise staying 0
++	 * keeps brcmfmac's own switch from ever looking at the contents.
++	 */
++	sme.crypto.ciphers_pairwise = __DECONST(uint32_t *, ciphers);
++
++	if (lkpi_connect_privacy) {
++		if (!lkpi_hexdecode32(lkpi_connect_pmk_hex, pmk)) {
++			if_rele(ifp);
++			return (EINVAL);
++		}
++		sme.privacy = 1;
++		sme.crypto.wpa_versions = NL80211_WPA_VERSION_2;
++		sme.crypto.cipher_group = LKPI_WLAN_CIPHER_SUITE_CCMP;
++		sme.crypto.n_ciphers_pairwise = 1;
++		sme.crypto.akm_suites = __DECONST(uint32_t *, akms);
++		sme.crypto.n_akm_suites = 1;
++		sme.crypto.psk = pmk;
++	}
++
++	error = lwiphy->ops->connect(wiphy, ndev, &sme);
++	if_rele(ifp);
++	return (error < 0 ? -error : error);
++}
++
++static int
++lkpi_connect_go_sysctl(SYSCTL_HANDLER_ARGS)
++{
++	char ifname[IFNAMSIZ];
++	int error;
++
++	ifname[0] = '\0';
++	error = sysctl_handle_string(oidp, ifname, sizeof(ifname), req);
++	if (error != 0 || req->newptr == NULL)
++		return (error);
++	return (lkpi_connect_by_name(ifname));
++}
++SYSCTL_PROC(_compat_linuxkpi_80211, OID_AUTO, connect_go,
++    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
++    lkpi_connect_go_sysctl, "A",
++    "Write an interface name (e.g. wlan0) to connect it using the staged "
++    "connect_ssid/connect_pmk/connect_privacy");
++
++/* -------------------------------------------------------------------------- */
++
+ /* Keep public for as long as header files are using it too. */
+ int linuxkpi_debug_80211;
+ 

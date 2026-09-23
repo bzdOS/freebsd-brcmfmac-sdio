@@ -1,0 +1,9 @@
+# Apply in order against a FreeBSD src tree (git apply / git am).
+# Verified to apply cleanly to BOTH FreeBSD 15.1-RC3 and upstream main,
+# and each defect confirmed still present in main, as of 2026-09-23.
+0001-aw_mmc-do-not-arm-auto-CMD12-for-SDIO-CMD53.patch
+0002-linuxkpi-skb_header_cloned-must-not-claim-cloned.patch
+0003-linuxkpi-implement-eth_type_trans-and-eth_hw_addr_set.patch
+0004-sdio-poll-FN_READY-after-enabling-a-function.patch
+0005-linuxkpi-zero-the-net_device-driver-private-area.patch
+0006-sdiob-serialise-the-shared-CCB-and-retry-CMD52.patch

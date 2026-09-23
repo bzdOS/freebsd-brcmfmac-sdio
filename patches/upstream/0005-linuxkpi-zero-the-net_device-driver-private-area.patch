@@ -1,0 +1,42 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] linuxkpi: zero the net_device driver private area
+
+linuxkpi_alloc_netdev() allocates sizeof(*ndev) + len and then calls
+linuxkpi_init_dummy_netdev(), which memsets only sizeof(*ndev).  The
+trailing len bytes -- exactly what netdev_priv() hands back to the driver
+-- are never initialised, so every driver private struct starts as
+whatever was last in that heap memory.
+
+Linux allocates the whole thing with kvzalloc() in alloc_netdev_mqs() and
+drivers depend on it: a pointer field that is only assigned on some paths
+is expected to read back NULL otherwise.
+
+The failure this was found through: brcmfmac's struct brcmf_if has
+fws_desc, assigned only when brcmf_fws_add_interface() runs to completion.
+brcmf_fws_reset_interface() checks it for NULL and then writes through it.
+With garbage there (recycled memory that happened to contain instruction
+bytes) the NULL check passed and the store faulted, panicking the kernel
+as soon as firmware events began to be delivered.
+
+Allocate with M_ZERO.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+--- a/sys/compat/linuxkpi/common/src/linux_netdev.c
++++ b/sys/compat/linuxkpi/common/src/linux_netdev.c
+@@ -398,7 +398,14 @@
+ {
+ 	struct net_device *ndev;
+ 
+-	ndev = malloc(sizeof(*ndev) + len, M_NETDEV, M_NOWAIT);
++	/*
++	 * M_ZERO: the driver's private area lives in the trailing
++	 * drv_priv[len] bytes and linuxkpi_init_dummy_netdev() below only
++	 * memsets sizeof(*ndev), so without this the private struct starts
++	 * out as recycled heap garbage.  Linux allocates the whole thing
++	 * with kvzalloc() and drivers rely on that.
++	 */
++	ndev = malloc(sizeof(*ndev) + len, M_NETDEV, M_NOWAIT | M_ZERO);
+ 	if (ndev == NULL)
+ 		return (ndev);
+ 

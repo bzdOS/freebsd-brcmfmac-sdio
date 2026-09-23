@@ -1,0 +1,86 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] linuxkpi: implement eth_type_trans() and eth_hw_addr_set()
+
+eth_type_trans() ignored the frame entirely and returned a constant
+ETHERTYPE_8023, so skb->protocol was always wrong and the Ethernet header
+was never pulled.
+
+Any consumer that switches on skb->protocol therefore misbehaves
+silently.  brcmfmac is a clear example: brcmf_fweh_process_skb() drops
+anything whose protocol is not ETH_P_LINK_CTL as its very first test, so
+*every* firmware event was discarded.  The SDIO layer read the event
+frames off the chip correctly and then threw them away, which made
+association impossible with no error anywhere.
+
+Implement it as Linux does: record the mac header, classify the
+destination into skb->pkt_type, pull ETH_HLEN so skb->data is the payload,
+and return the real ethertype.
+
+eth_hw_addr_set() was likewise a no-op, leaving dev->dev_addr zeroed, so
+an interface created from a driver that uses it had no MAC address.  Copy
+the address.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/compat/linuxkpi/common/include/linux/etherdevice.h b/sys/compat/linuxkpi/common/include/linux/etherdevice.h
+index b9a4951de..6f2a6ff18 100644
+--- a/sys/compat/linuxkpi/common/include/linux/etherdevice.h
++++ b/sys/compat/linuxkpi/common/include/linux/etherdevice.h
+@@ -143,14 +143,54 @@ device_get_mac_address(struct device *dev, char *dst)
+ static inline uint16_t
+ eth_type_trans(struct sk_buff *skb, struct net_device *dev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
+-	return (htons(ETHERTYPE_8023));
++	const struct ethhdr *eh;
++
++	/*
++	 * This used to return a fixed ETHERTYPE_8023 without looking at the
++	 * frame at all, which silently broke every consumer that switches on
++	 * skb->protocol.  brcmfmac is one: brcmf_fweh_process_skb() drops any
++	 * skb whose protocol is not ETH_P_LINK_CTL, so *every* firmware event
++	 * (association results included) was discarded before reaching the
++	 * event handler -- the SDIO side dutifully read the frames and then
++	 * threw them away.
++	 *
++	 * Do what Linux does: remember where the Ethernet header starts, pull
++	 * it off so skb->data is the payload, and return the real ethertype.
++	 * Callers that need the header back use skb_mac_header().
++	 */
++	skb->dev = dev;
++	skb_reset_mac_header(skb);
++
++	if (skb->len < ETH_HLEN)
++		return (htons(ETHERTYPE_8023));
++
++	eh = (const struct ethhdr *)skb->data;
++	skb_pull(skb, ETH_HLEN);
++
++	if (is_multicast_ether_addr(eh->h_dest)) {
++		if (is_broadcast_ether_addr(eh->h_dest))
++			skb->pkt_type = PACKET_BROADCAST;
++		else
++			skb->pkt_type = PACKET_MULTICAST;
++	} else if (dev != NULL &&
++	    !ether_addr_equal(eh->h_dest, dev->dev_addr)) {
++		skb->pkt_type = PACKET_OTHERHOST;
++	}
++	/*
++	 * A frame addressed to us keeps the default 0.  Note this enum has no
++	 * PACKET_HOST, so 0 aliases to PACKET_BROADCAST; nothing in tree reads
++	 * it for that distinction (brcmfmac only compares against
++	 * PACKET_MULTICAST, for a statistics counter).
++	 */
++
++	/* h_proto is already in network byte order. */
++	return (eh->h_proto);
+ }
+ 
+ static inline void
+ eth_hw_addr_set(struct net_device *dev, const u8 *addr)
+ {
+-	pr_debug("%s: TODO (if we want to)\n", __func__);
++	memcpy(dev->dev_addr, addr, ETH_ALEN);
+ }
+ 
+ static inline int

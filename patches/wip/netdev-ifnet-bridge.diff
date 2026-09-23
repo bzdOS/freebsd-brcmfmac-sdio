@@ -1,0 +1,423 @@
+diff --git a/sys/compat/linuxkpi/common/include/linux/netdevice.h b/sys/compat/linuxkpi/common/include/linux/netdevice.h
+index dfed5fbd6..34ab9eb1c 100644
+--- a/sys/compat/linuxkpi/common/include/linux/netdevice.h
++++ b/sys/compat/linuxkpi/common/include/linux/netdevice.h
+@@ -115,6 +115,14 @@ struct net_device {
+ 	/* net_device fields seen publicly. */
+ 	/* XXX can we later make some aliases to ifnet? */
+ 	char				name[IFNAMSIZ];
++	/*
++	 * The FreeBSD if_t backing this net_device once registered.  Kept
++	 * as void* (rather than pulling net/if_var.h in here) because this
++	 * header is included far outside networking code (DRM/GPU LinuxKPI
++	 * consumers among them); linux_netdev.c casts it back to if_t.
++	 */
++	void				*ifp;
++	bool				queue_stopped;
+ 	struct wireless_dev		*ieee80211_ptr;
+ 	uint8_t				dev_addr[ETH_ALEN];
+ 	struct netdev_hw_addr_list	mc;
+@@ -158,6 +166,12 @@ struct net_device {
+ 	uint8_t				drv_priv[0] __aligned(CACHE_LINE_SIZE);
+ };
+ 
++int linuxkpi_register_netdev(struct net_device *);
++void linuxkpi_unregister_netdev(struct net_device *);
++void linuxkpi_netif_rx(struct sk_buff *);
++void linuxkpi_netif_carrier_on(struct net_device *);
++void linuxkpi_netif_carrier_off(struct net_device *);
++
+ #define	SET_NETDEV_DEV(_ndev, _dev)	(_ndev)->dev.parent = _dev;
+ 
+ enum net_device_path_type {
+@@ -410,13 +424,13 @@ netif_carrier_ok(struct net_device *ndev)
+ static __inline void
+ netif_carrier_off(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	linuxkpi_netif_carrier_off(ndev);
+ }
+ 
+ static __inline void
+ netif_carrier_on(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	linuxkpi_netif_carrier_on(ndev);
+ }
+ 
+ /* -------------------------------------------------------------------------- */
+@@ -424,20 +438,19 @@ netif_carrier_on(struct net_device *ndev)
+ static __inline bool
+ netif_queue_stopped(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
+-	return (false);
++	return (ndev->queue_stopped);
+ }
+ 
+ static __inline void
+ netif_stop_queue(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	ndev->queue_stopped = true;
+ }
+ 
+ static __inline void
+ netif_wake_queue(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	ndev->queue_stopped = false;
+ }
+ 
+ /* -------------------------------------------------------------------------- */
+@@ -447,8 +460,7 @@ register_netdevice(struct net_device *ndev)
+ {
+ 
+ 	/* assert rtnl_locked? */
+-	pr_debug("%s: TODO\n", __func__);
+-	return (0);
++	return (linuxkpi_register_netdev(ndev));
+ }
+ 
+ static __inline int
+@@ -459,20 +471,19 @@ register_netdev(struct net_device *ndev)
+ 	/* lock */
+ 	error = register_netdevice(ndev);
+ 	/* unlock */
+-	pr_debug("%s: TODO\n", __func__);
+ 	return (error);
+ }
+ 
+ static __inline void
+ unregister_netdev(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	linuxkpi_unregister_netdev(ndev);
+ }
+ 
+ static __inline void
+ unregister_netdevice(struct net_device *ndev)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	linuxkpi_unregister_netdev(ndev);
+ }
+ 
+ /* -------------------------------------------------------------------------- */
+@@ -480,13 +491,13 @@ unregister_netdevice(struct net_device *ndev)
+ static __inline void
+ netif_rx(struct sk_buff *skb)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	linuxkpi_netif_rx(skb);
+ }
+ 
+ static __inline void
+ netif_rx_ni(struct sk_buff *skb)
+ {
+-	pr_debug("%s: TODO\n", __func__);
++	linuxkpi_netif_rx(skb);
+ }
+ 
+ /* -------------------------------------------------------------------------- */
+diff --git a/sys/compat/linuxkpi/common/src/linux_netdev.c b/sys/compat/linuxkpi/common/src/linux_netdev.c
+index 2de0f0ce4..cd70a669d 100644
+--- a/sys/compat/linuxkpi/common/src/linux_netdev.c
++++ b/sys/compat/linuxkpi/common/src/linux_netdev.c
+@@ -31,13 +31,279 @@
+ #include <sys/types.h>
+ #include <sys/kernel.h>
+ #include <sys/sysctl.h>
++#include <sys/mbuf.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++
++#include <net/if.h>
++#include <net/if_var.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/vnet.h>
+ 
+ #include <linux/bitops.h>
+ #include <linux/list.h>
++#include <linux/skbuff.h>
++#include <linux/etherdevice.h>
+ #include <linux/netdevice.h>
+ 
+ MALLOC_DEFINE(M_NETDEV, "lkpindev", "Linux KPI netdevice compat");
+ 
++/* -------------------------------------------------------------------------- */
++/*
++ * Minimal net_device -> FreeBSD ifnet bridge.
++ *
++ * This LinuxKPI port was written for mac80211 (softmac) drivers, which never
++ * go through plain register_netdev()/netif_rx() -- they attach through
++ * net80211 instead (see linux_80211.c).  A *fullmac* cfg80211 driver
++ * (brcmfmac among others) presents its own Ethernet-framed net_device
++ * directly and expects register_netdev()/netif_rx()/ndo_start_xmit to work
++ * like they do on Linux.  Those were plain pr_debug("TODO") no-ops with no
++ * backing ifnet at all, so a fullmac driver's probe "succeeded" but produced
++ * no interface anyone could see or use.  This block gives every net_device
++ * a real IFT_ETHER ifnet for the lifetime of its registration.
++ */
++
++static volatile u_int lkpi_ndev_unit;
++
++static void
++lkpi_ndev_init(void *arg)
++{
++	struct net_device *ndev = arg;
++
++	/*
++	 * ether_output() refuses to hand us anything unless IFF_DRV_RUNNING
++	 * is set ("Network is down" from sendto(2) otherwise), so the flag
++	 * has to be maintained here and in the SIOCSIFFLAGS path -- it is
++	 * the driver's to set, not the stack's.
++	 */
++	if (ndev != NULL && ndev->ifp != NULL)
++		if_setdrvflagbits(ndev->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
++}
++
++static void
++lkpi_ndev_qflush(if_t ifp __unused)
++{
++	/* lkpi_ndev_transmit() is synchronous; nothing queued to drain. */
++}
++
++static int
++lkpi_ndev_transmit(if_t ifp, struct mbuf *m)
++{
++	struct net_device *ndev;
++	struct sk_buff *skb;
++	int len;
++
++	ndev = if_getsoftc(ifp);
++	if (ndev == NULL || ndev->netdev_ops == NULL ||
++	    ndev->netdev_ops->ndo_start_xmit == NULL ||
++	    (ndev->flags & IFF_UP) == 0 || ndev->queue_stopped) {
++		m_freem(m);
++		if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
++		return (ENXIO);
++	}
++
++	len = m->m_pkthdr.len;
++	skb = linuxkpi_dev_alloc_skb(len + ndev->needed_headroom, GFP_ATOMIC);
++	if (skb == NULL) {
++		m_freem(m);
++		return (ENOBUFS);
++	}
++	skb_reserve(skb, ndev->needed_headroom);
++	m_copydata(m, 0, len, skb_put(skb, len));
++	m_freem(m);
++
++	skb->dev = ndev;
++	/*
++	 * Read the ethertype out of the frame, but do NOT use
++	 * eth_type_trans() here: that is an RX-side helper and it *pulls*
++	 * the Ethernet header off the skb.  On transmit the header has to
++	 * stay -- brcmfmac reads it straight back out of skb->data to pick
++	 * the destination.  Stripping it made every outgoing frame 14 bytes
++	 * short and brcmf_proto_tx_queue_data() rejected the lot with ENXIO.
++	 */
++	if (skb->len >= ETH_HLEN)
++		skb->protocol = ((const struct ethhdr *)skb->data)->h_proto;
++
++	/* Return value is NETDEV_TX_OK/BUSY; the skb is always consumed. */
++	(void) ndev->netdev_ops->ndo_start_xmit(skb, ndev);
++	if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
++	if_inc_counter(ifp, IFCOUNTER_OBYTES, len);
++	return (0);
++}
++
++static int
++lkpi_ndev_ioctl(if_t ifp, u_long cmd, caddr_t data)
++{
++	struct net_device *ndev;
++	int error;
++
++	ndev = if_getsoftc(ifp);
++	error = 0;
++
++	switch (cmd) {
++	case SIOCSIFFLAGS:
++		if (if_getflags(ifp) & IFF_UP) {
++			if ((ndev->flags & IFF_UP) == 0) {
++				if (ndev->netdev_ops->ndo_open != NULL)
++					error = -ndev->netdev_ops->ndo_open(ndev);
++				if (error == 0) {
++					ndev->flags |= IFF_UP;
++					if_setdrvflagbits(ifp, IFF_DRV_RUNNING,
++					    IFF_DRV_OACTIVE);
++				}
++			}
++		} else {
++			if (ndev->flags & IFF_UP) {
++				if (ndev->netdev_ops->ndo_stop != NULL)
++					ndev->netdev_ops->ndo_stop(ndev);
++				ndev->flags &= ~IFF_UP;
++			}
++			if_setdrvflagbits(ifp, 0,
++			    IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
++		}
++		break;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		if (ndev->netdev_ops->ndo_set_rx_mode != NULL)
++			ndev->netdev_ops->ndo_set_rx_mode(ndev);
++		break;
++	default:
++		error = ether_ioctl(ifp, cmd, data);
++		break;
++	}
++	return (error);
++}
++
++int
++linuxkpi_register_netdev(struct net_device *ndev)
++{
++	if_t ifp;
++	u_int unit;
++
++	if (ndev->ifp != NULL)
++		return (0);
++
++	ifp = if_alloc(IFT_ETHER);
++	if (ifp == NULL)
++		return (-ENOMEM);
++
++	unit = atomic_fetchadd_int(&lkpi_ndev_unit, 1);
++	if_initname(ifp, "wlan", unit);
++	snprintf(ndev->name, sizeof(ndev->name), "wlan%u", unit);
++
++	if_setsoftc(ifp, ndev);
++	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
++	if_setmtu(ifp, ETHERMTU);
++	if_setinitfn(ifp, lkpi_ndev_init);
++	if_setioctlfn(ifp, lkpi_ndev_ioctl);
++	if_settransmitfn(ifp, lkpi_ndev_transmit);
++	if_setqflushfn(ifp, lkpi_ndev_qflush);
++
++	/*
++	 * ether_ifattach() walks the network stack's VIMAGE-global lists
++	 * (if_addgroup() et al reach V_ifg_head via curvnet).  Whatever
++	 * thread ends up calling register_netdev() -- for brcmfmac this is
++	 * not necessarily the kldload thread, it can be a firmware-request
++	 * completion running on a driver workqueue -- has no reason to have
++	 * curvnet set, and net/if.c dereferences it unconditionally: that
++	 * was a NULL-curvnet panic in if_addgroup() the first time this ran
++	 * (FAR 0x28, i.e. curvnet+offsetof(struct vnet, ...)).  We only ever
++	 * run in the default vnet here, so pin it explicitly.
++	 */
++	CURVNET_SET(vnet0);
++	ether_ifattach(ifp, ndev->dev_addr);
++	CURVNET_RESTORE();
++
++	ndev->ifp = ifp;
++	ndev->reg_state = NETREG_REGISTERED;
++	return (0);
++}
++
++void
++linuxkpi_unregister_netdev(struct net_device *ndev)
++{
++	if_t ifp;
++
++	ifp = ndev->ifp;
++	if (ifp == NULL)
++		return;
++
++	CURVNET_SET(vnet0);
++	ether_ifdetach(ifp);
++	if_free(ifp);
++	CURVNET_RESTORE();
++	ndev->ifp = NULL;
++	ndev->reg_state = NETREG_DUMMY;
++}
++
++void
++linuxkpi_netif_rx(struct sk_buff *skb)
++{
++	struct net_device *ndev;
++	struct mbuf *m;
++	uint8_t *frame;
++	uint32_t framelen;
++
++	ndev = skb->dev;
++	if (ndev == NULL || ndev->ifp == NULL) {
++		kfree_skb(skb);
++		return;
++	}
++
++	/*
++	 * eth_type_trans() has already pulled the Ethernet header off
++	 * skb->data (that is what makes skb->protocol meaningful), but
++	 * ether_input() wants the whole frame.  Rewind to the mac header and
++	 * take everything from there; if nothing was pulled this degrades to
++	 * exactly skb->data/skb->len.
++	 */
++	frame = skb_mac_header(skb);
++	if (frame == NULL || frame > skb->data)
++		frame = skb->data;
++	framelen = skb->len + (uint32_t)(skb->data - frame);
++
++	m = m_get2(framelen, M_NOWAIT, MT_DATA, M_PKTHDR);
++	if (m == NULL) {
++		kfree_skb(skb);
++		return;
++	}
++	m_copyback(m, 0, framelen, (caddr_t)frame);
++	m->m_pkthdr.len = framelen;
++	m->m_len = framelen;
++	m->m_pkthdr.rcvif = ndev->ifp;
++
++	/* ether_input() accounts IFCOUNTER_IBYTES; the packet count is ours. */
++	if_inc_counter(ndev->ifp, IFCOUNTER_IPACKETS, 1);
++
++	CURVNET_SET(vnet0);
++	if_input(ndev->ifp, m);
++	CURVNET_RESTORE();
++	kfree_skb(skb);
++}
++
++void
++linuxkpi_netif_carrier_on(struct net_device *ndev)
++{
++
++	if (ndev->ifp != NULL) {
++		CURVNET_SET(vnet0);
++		if_link_state_change(ndev->ifp, LINK_STATE_UP);
++		CURVNET_RESTORE();
++	}
++}
++
++void
++linuxkpi_netif_carrier_off(struct net_device *ndev)
++{
++
++	if (ndev->ifp != NULL) {
++		CURVNET_SET(vnet0);
++		if_link_state_change(ndev->ifp, LINK_STATE_DOWN);
++		CURVNET_RESTORE();
++	}
++}
++
+ #define	NAPI_LOCK_INIT(_ndev)		\
+     mtx_init(&(_ndev)->napi_mtx, "napi_mtx", NULL, MTX_DEF)
+ #define	NAPI_LOCK_DESTROY(_ndev)	mtx_destroy(&(_ndev)->napi_mtx)
+@@ -399,11 +665,14 @@ linuxkpi_alloc_netdev(size_t len, const char *name, uint32_t flags,
+ 	struct net_device *ndev;
+ 
+ 	/*
+-	 * M_ZERO: the driver's private area lives in the trailing
++	 * M_ZERO matters: the driver's private area lives in the trailing
+ 	 * drv_priv[len] bytes and linuxkpi_init_dummy_netdev() below only
+ 	 * memsets sizeof(*ndev), so without this the private struct starts
+-	 * out as recycled heap garbage.  Linux allocates the whole thing
+-	 * with kvzalloc() and drivers rely on that.
++	 * as recycled heap garbage.  Linux allocates the whole thing with
++	 * kvzalloc() and every driver relies on that: brcmfmac's struct
++	 * brcmf_if has pointers it only assigns conditionally (fws_desc
++	 * among them), and acting on a garbage one panicked the kernel with
++	 * a wild store as soon as firmware events started being delivered.
+ 	 */
+ 	ndev = malloc(sizeof(*ndev) + len, M_NETDEV, M_NOWAIT | M_ZERO);
+ 	if (ndev == NULL)

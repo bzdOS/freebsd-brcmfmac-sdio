@@ -1,0 +1,187 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] sdiob: serialise the shared CCB and retry CMD52
+
+Two independent defects in the SDIO CAM bridge, both in sdiob.c.
+
+1) Nothing serialises sc->ccb.  Every CMD52/CMD53 issued through the
+   periph shares that one CCB, and cam_periph_runccb() drops the periph
+   mutex while it sleeps for completion.  A second caller (an SDIO
+   interrupt poller, a driver worker thread) therefore memsets and
+   re-issues the very CCB that is still in flight in the host controller,
+   which ends as
+
+     panic: camq_remove: Attempt to remove out-of-bounds index -3
+
+   Add an sx lock held across the whole transaction.  Linux serialises the
+   same traffic via mmc_claim_host().
+
+2) CMD52 was issued with cam_fill_mmcio(..., retries = 0, ...).  A
+   newly-enumerated SDIO card can legitimately miss an early CMD52 with a
+   plain response timeout while its internal state settles -- Linux's mmc
+   core retries for exactly this reason, and sunxi-mmc goes as far as
+   special-casing RESP_TIMEOUT for SD_IO_RW_DIRECT with the comment "For
+   some cmds timeout is normal with sd/mmc cards".  With no retries at all
+   a single such timeout is a permanent probe failure.
+
+   Retry in the driver with a real delay between attempts rather than
+   raising CAM's retry count: cam_periph_error() turns CAM_CMD_TIMEOUT
+   into an immediate ERESTART with no pause, and what the card needs is
+   elapsed time.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/dev/sdio/sdiob.c b/sys/dev/sdio/sdiob.c
+index cb2cc0da6..ba8519fd8 100644
+--- a/sys/dev/sdio/sdiob.c
++++ b/sys/dev/sdio/sdiob.c
+@@ -72,6 +72,7 @@
+ #include <sys/malloc.h>
+ #include <sys/module.h>
+ #include <sys/mutex.h>
++#include <sys/sx.h>
+ 
+ #include <cam/cam.h>
+ #include <cam/cam_ccb.h>
+@@ -111,6 +112,16 @@ struct sdiob_softc {
+ 	struct card_info		cardinfo;
+ 	struct cam_periph		*periph;
+ 	union ccb			*ccb;
++	/*
++	 * Serialises every CMD52/CMD53 issued through this periph.  All of
++	 * them share the single sc->ccb, and cam_periph_runccb() drops the
++	 * periph mutex while it sleeps for completion, so without this a
++	 * second caller (an SDIO IRQ poller, a driver's worker thread) can
++	 * memset() and re-issue the very CCB that is still in flight in
++	 * the host controller -- double completion, camq_remove() panic.
++	 * Linux serialises the same way via mmc_claim_host().
++	 */
++	struct sx			io_lock;
+ 	struct task			discover_task;
+ 
+ 	/* Newbus side. */
+@@ -143,33 +154,62 @@ sdiob_rw_direct_sc(struct sdiob_softc *sc, uint8_t fn, uint32_t addr, bool wr,
+ {
+ 	uint32_t arg, flags;
+ 	int error;
++	int attempt;
+ 
+ 	KASSERT((val != NULL), ("%s val passed as NULL\n", __func__));
+ 
+-	if (sc->ccb == NULL)
+-		sc->ccb = xpt_alloc_ccb();
+-	else
+-		memset(sc->ccb, 0, sizeof(*sc->ccb));
+-	xpt_setup_ccb(&sc->ccb->ccb_h, sc->periph->path, CAM_PRIORITY_NORMAL);
+-	CAM_DEBUG(sc->ccb->ccb_h.path, CAM_DEBUG_TRACE,
+-	    ("%s(fn=%d, addr=%#02x, wr=%d, *val=%#02x)\n", __func__,
+-	    fn, addr, wr, *val));
+-
+ 	flags = MMC_RSP_R5 | MMC_CMD_AC;
+ 	arg = SD_IO_RW_FUNC(fn) | SD_IO_RW_ADR(addr);
+ 	if (wr)
+ 		arg |= SD_IO_RW_WR | SD_IO_RW_RAW | SD_IO_RW_DAT(*val);
+ 
+-	cam_fill_mmcio(&sc->ccb->mmcio,
+-		/*retries*/ 0,
+-		/*cbfcnp*/ NULL,
+-		/*flags*/ CAM_DIR_NONE,
+-		/*mmc_opcode*/ SD_IO_RW_DIRECT,
+-		/*mmc_arg*/ arg,
+-		/*mmc_flags*/ flags,
+-		/*mmc_data*/ 0,
+-		/*timeout*/ sc->cardinfo.f[fn].timeout);
+-	error = cam_periph_runccb(sc->ccb, sdioerror, CAM_FLAG_NONE, 0, NULL);
++	/* CMD52 (SD_IO_RW_DIRECT) response timeouts are not a transient edge
++	 * case on this SoC family -- they're a documented, expected quirk of
++	 * the sunxi-mmc/aw_mmc controller silicon itself. Linux's own driver
++	 * for the identical A64 controller (drivers/mmc/host/sunxi-mmc.c)
++	 * special-cases exactly this: on a bare response-timeout error for
++	 * SD_IO_SEND_OP_COND or SD_IO_RW_DIRECT, it does NOT report the
++	 * error at all ("For some cmds timeout is normal with sd/mmc
++	 * cards") -- it just lets the command be retried, with no real
++	 * upper bound.
++	 *
++	 * retries==0 (stock FreeBSD) turned every one of these into a
++	 * permanent, fatal probe failure. Bumping CAM's own `retries` count
++	 * (tried 3, then 15) did NOT help -- measured live, 15 back-to-back
++	 * attempts on the same register still exhaust every time. CAM's
++	 * built-in retry (cam_periph_error -> ERESTART) resends essentially
++	 * immediately with no gap, which means it's re-issuing while the
++	 * card may still be mid-settle from the attempt that just "timed
++	 * out" -- consistent with a controller/card quirk that needs actual
++	 * elapsed time, not just another attempt. So: keep CAM's own retry
++	 * out of this (0) and do the retry loop here instead, with a real
++	 * delay between attempts. */
++	for (attempt = 0; ; attempt++) {
++		if (sc->ccb == NULL)
++			sc->ccb = xpt_alloc_ccb();
++		else
++			memset(sc->ccb, 0, sizeof(*sc->ccb));
++		xpt_setup_ccb(&sc->ccb->ccb_h, sc->periph->path,
++		    CAM_PRIORITY_NORMAL);
++		CAM_DEBUG(sc->ccb->ccb_h.path, CAM_DEBUG_TRACE,
++		    ("%s(fn=%d, addr=%#02x, wr=%d, *val=%#02x)\n", __func__,
++		    fn, addr, wr, *val));
++
++		cam_fill_mmcio(&sc->ccb->mmcio,
++			/*retries*/ 0,
++			/*cbfcnp*/ NULL,
++			/*flags*/ CAM_DIR_NONE,
++			/*mmc_opcode*/ SD_IO_RW_DIRECT,
++			/*mmc_arg*/ arg,
++			/*mmc_flags*/ flags,
++			/*mmc_data*/ 0,
++			/*timeout*/ sc->cardinfo.f[fn].timeout);
++		error = cam_periph_runccb(sc->ccb, sdioerror, CAM_FLAG_NONE,
++		    0, NULL);
++		if (error == 0 || attempt >= 8)
++			break;
++		DELAY(5000);
++	}
+ 	if (error != 0) {
+ 		if (sc->dev != NULL)
+ 			device_printf(sc->dev,
+@@ -198,9 +238,11 @@ sdio_rw_direct(device_t dev, uint8_t fn, uint32_t addr, bool wr,
+ 	int error;
+ 
+ 	sc = device_get_softc(dev);
++	sx_xlock(&sc->io_lock);
+ 	cam_periph_lock(sc->periph);
+ 	error = sdiob_rw_direct_sc(sc, fn, addr, wr, val);
+ 	cam_periph_unlock(sc->periph);
++	sx_xunlock(&sc->io_lock);
+ 	return (error);
+ }
+ 
+@@ -312,8 +354,10 @@ sdiob_rw_extended_cam(struct sdiob_softc *sc, uint8_t fn, uint32_t addr,
+ 		/* Stop cmd. */
+ 	}
+ #endif
++	/* See the CMD52 comment in sdiob_rw_direct_sc(): same card-settling
++	 * timeout risk applies to CMD53. */
+ 	cam_fill_mmcio(&sc->ccb->mmcio,
+-		/*retries*/ 0,
++		/*retries*/ 3,
+ 		/*cbfcnp*/ NULL,
+ 		/*flags*/ cam_flags,
+ 		/*mmc_opcode*/ SD_IO_RW_EXTENDED,
+@@ -432,9 +476,11 @@ sdiob_rw_extended(device_t dev, uint8_t fn, uint32_t addr, bool wr,
+ 	int error;
+ 
+ 	sc = device_get_softc(dev);
++	sx_xlock(&sc->io_lock);
+ 	cam_periph_lock(sc->periph);
+ 	error = sdiob_rw_extended_sc(sc, fn, addr, wr, size, buffer, incaddr);
+ 	cam_periph_unlock(sc->periph);
++	sx_xunlock(&sc->io_lock);
+ 	return (error);
+ }
+ 
+@@ -1034,6 +1080,7 @@ sdiobregister(struct cam_periph *periph, void *arg)
+ 	}
+ 	sc->sdio_state = SDIO_STATE_DEAD;
+ 	sc->nb_state = NB_STATE_DEAD;
++	sx_init(&sc->io_lock, "sdiob io");
+ 	TASK_INIT(&sc->discover_task, 0, sdiobdiscover, periph);
+ 
+ 	/* Refcount until we are setup.  Can't block. */

@@ -1,0 +1,398 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] linuxkpi/mmc: correct the SDIO accessors
+
+Four defects in the LinuxKPI SDIO shim, all of which silently corrupt the
+transaction rather than failing visibly.
+
+1) sdio_readl()/sdio_writel() emulated a 32-bit access with four byte-wide
+   CMD52s.  A Broadcom SDIO device encodes a 32-bit backplane access by
+   setting SBSDIO_SB_ACCESS_2_4B_FLAG in the address and then expects one
+   32-bit CMD53; four byte transfers are a protocol violation Linux never
+   emits.  The chip stops answering *any* command afterwards, function 0
+   included, which presents as response timeouts at unpredictable
+   addresses.  Issue a single 4-byte CMD53.
+
+2) sdio_readsb()/sdio_writesb() forwarded to the incrementing memcpy
+   variants.  In Linux these are the fixed-address (FIFO) form; brcmfmac
+   uses sdio_readsb() for every frame read, so this walked the function's
+   address space instead of draining its FIFO.
+
+3) Every SDIO_*_EXTENDED() call dispatched on func->bsd_func->dev, the
+   child, instead of its parent bridge, so the kobj method never arrived.
+   The direct (CMD52) path in sdio_subr.c already used the parent.
+
+4) sdio_claim_host()/sdio_release_host() were "return 0" stubs.  Linux
+   drivers rely on them for mutual exclusion; make them a real recursive
+   lock.  The CCCR interrupt poller is moved off the shared
+   taskqueue_thread onto its own thread for the same reason: the firmware
+   ready callback blocks on that queue for seconds, and the poller is the
+   only thing that can notice the reply it is waiting for.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/compat/linuxkpi/common/src/linux_mmc.c b/sys/compat/linuxkpi/common/src/linux_mmc.c
+index ea9bcb77f..695c1a83a 100644
+--- a/sys/compat/linuxkpi/common/src/linux_mmc.c
++++ b/sys/compat/linuxkpi/common/src/linux_mmc.c
+@@ -30,7 +30,10 @@
+ #include <sys/module.h>
+ #include <sys/mutex.h>
+ #include <sys/callout.h>
++#include <sys/sx.h>
++#include <sys/taskqueue.h>
+ #include <sys/systm.h>
++#include <sys/endian.h>
+ 
+ #include <machine/bus.h>
+ 
+@@ -80,7 +83,7 @@
+ /* Glue state (single card, static)                                    */
+ /* ------------------------------------------------------------------ */
+ 
+-#define	LKSDIO_POLL_MS	50		/* CCCR interrupt poll period */
++#define	LKSDIO_POLL_MS	10		/* CCCR interrupt poll period */
+ 
+ struct lksdio_softc {
+ 	struct sdio_func	func;		/* Linux view of the function */
+@@ -99,7 +102,24 @@ static driver_t lksdio_newbus_driver;
+ static struct mmc_card		lksdio_card;
+ static struct mmc_host		lksdio_host;
+ static bool			lksdio_card_ready;
+-static struct callout		lksdio_poll_callout;
++/*
++ * The CCCR interrupt poller gets its own taskqueue thread (the analogue of
++ * Linux's per-host sdio_irq_thread).  It must NOT share taskqueue_thread:
++ * that queue has a single thread, and the driver's firmware-ready callback
++ * runs there too -- it blocks for seconds in brcmf_attach() waiting for a
++ * dongle reply that can only be noticed by this poller.  Sharing the thread
++ * made every control command time out ("dongle is not responding: -60").
++ */
++static struct taskqueue		*lksdio_tq;
++static struct timeout_task	lksdio_poll_task;
++/*
++ * The Linux "claim host" lock.  brcmfmac (like every Linux SDIO driver)
++ * brackets all sdio_* traffic with sdio_claim_host()/sdio_release_host()
++ * from several threads (probe, dpc worker, irq handler); Linux's mmc core
++ * relies on that for serialisation and so do we.  Recursive because the
++ * Linux claim is (mmc_claim_host() keeps a claim count).
++ */
++static struct sx		lksdio_host_lock;
+ static bool			lksdio_poll_on;
+ static struct sdio_func_bsd	*lksdio_poll_nfunc;
+ static device_t			lksdio_bus_dev;
+@@ -256,6 +276,14 @@ lksdio_attach(device_t dev)
+ 
+ 	device_printf(dev, "lksdio: SDIO func %u %04x:%04x, calling %s probe\n",
+ 	    sc->func.num, sc->func.vendor, sc->func.device, lksdio_driver->name);
++	/* TEMPORARY probe-time diagnostic (2026-09-20): brcmfmac derives
++	 * sdiodev->func1 from func->card->sdio_func[0] and faults on NULL. */
++	device_printf(dev, "lksdio: DIAG this=%p card=%p slot0=%p slot1=%p "
++	    "slot0.num=%u slot1.num=%u\n",
++	    (void *)&sc->func, (void *)sc->func.card,
++	    (void *)lksdio_card.sdio_func[0], (void *)lksdio_card.sdio_func[1],
++	    lksdio_card.sdio_func[0] ? lksdio_card.sdio_func[0]->num : 9999,
++	    lksdio_card.sdio_func[1] ? lksdio_card.sdio_func[1]->num : 9999);
+ 
+ 	error = lksdio_driver->probe(&sc->func, id);
+ 	if (error != 0) {
+@@ -351,17 +379,19 @@ sdio_unregister_driver(struct sdio_driver *sdrv)
+ int
+ sdio_claim_host(struct sdio_func *func)
+ {
++	sx_xlock(&lksdio_host_lock);
+ 	return (0);
+ }
+ 
+ int
+ sdio_release_host(struct sdio_func *func)
+ {
++	sx_xunlock(&lksdio_host_lock);
+ 	return (0);
+ }
+ 
+ int
+-sdio_enable_func(struct sdio_func *func)
++lkpi_sdio_enable_func(struct sdio_func *func)
+ {
+ 	struct sdio_func_bsd *nf = func->bsd_func;
+ 	int rc;
+@@ -373,17 +403,50 @@ sdio_enable_func(struct sdio_func *func)
+ }
+ 
+ int
+-sdio_disable_func(struct sdio_func *func)
++lkpi_sdio_disable_func(struct sdio_func *func)
+ {
+ 	return (sdio_disable_func_bsd(func->bsd_func));
+ }
+ 
+ int
+-sdio_set_block_size(struct sdio_func *func, unsigned blksz)
++lkpi_sdio_set_block_size(struct sdio_func *func, unsigned blksz)
+ {
+-	struct sdio_func_bsd *nf = func->bsd_func;
++	struct sdio_func_bsd *nf;
+ 	int rc;
+ 
++	/* Defensive: a NULL func here used to panic the kernel (seen while
++	 * the func1/func2 slot wiring was still wrong); fail loudly instead. */
++	if (func == NULL) {
++		printf("lksdio: sdio_set_block_size(NULL, %u) called from %p\n",
++		    blksz, __builtin_return_address(0));
++		return (-EINVAL);
++	}
++	nf = func->bsd_func;
++	if (nf == NULL) {
++		printf("lksdio: sdio_set_block_size: func=%p num=%u card=%p "
++		    "bsd=%p | slot0=%p slot1=%p | caller=%p\n",
++		    (void *)func, func->num, (void *)func->card,
++		    (void *)func->bsd_func,
++		    (void *)lksdio_card.sdio_func[0],
++		    (void *)lksdio_card.sdio_func[1],
++		    __builtin_return_address(0));
++		printf("lksdio: LAYOUT sizeof(device)=%zu sizeof(mmc_card)=%zu "
++		    "offsetof(mmc_card,sdio_func)=%zu &card=%p &slot0=%p\n",
++		    sizeof(struct device), sizeof(struct mmc_card),
++		    __offsetof(struct mmc_card, sdio_func),
++		    (void *)&lksdio_card, (void *)&lksdio_card.sdio_func[0]);
++		{
++			const uint64_t *w = (const uint64_t *)&lksdio_card;
++			int i;
++			for (i = 0x100/8; i <= 0x160/8; i++)
++				printf("lksdio: card+0x%03x = 0x%016jx%s\n",
++				    i * 8, (uintmax_t)w[i],
++				    (void *)(uintptr_t)w[i] == (void *)func ?
++				    "   <== the value brcmfmac used" : "");
++		}
++		return (-EINVAL);
++	}
++
+ 	rc = sdio_set_block_size_bsd(nf, blksz);
+ 	if (rc == 0)
+ 		func->cur_blksize = blksz;
+@@ -417,69 +480,77 @@ sdio_f0_writeb(struct sdio_func *func, unsigned char b, unsigned int addr, int *
+ unsigned int
+ sdio_readl(struct sdio_func *func, unsigned int addr, int *err_ret)
+ {
+-	struct sdio_func_bsd *nf = func->bsd_func;
+-	uint32_t v;
+-	int err, i;
+-	uint8_t c;
++	uint32_t v __aligned(8);
++	int err;
+ 
+-	/* 4 byte-mode CMD52 reads; the chip is little endian. */
++	/*
++	 * Must be a single 4-byte CMD53 (incrementing address), exactly like
++	 * Linux's sdio_readl() -> sdio_io_rw_ext_helper().  brcmfmac encodes
++	 * a 32-bit backplane access by setting SBSDIO_SB_ACCESS_2_4B_FLAG
++	 * (bit 15) in the F1 address; the Broadcom SDIO device core then
++	 * expects one 32-bit transfer.  Emulating this with four CMD52 byte
++	 * accesses (what this function used to do) is a protocol violation
++	 * the chip never sees from Linux -- on the AP6212/BCM43430 it left
++	 * the SDIO core silent to *every* subsequent command (F0 included),
++	 * which showed up as random-point AW_MMC_INT_RESP_TIMEOUTs during
++	 * brcmf_chip_attach() that no amount of retrying could clear.
++	 */
+ 	v = 0;
+-	for (i = 0; i < 4; i++) {
+-		c = sdio_read_1_bsd(nf, addr + i, &err);
+-		if (err != 0) {
+-			if (err_ret != NULL)
+-				*err_ret = err;
+-			return (0);
+-		}
+-		v |= (uint32_t)c << (8 * i);
+-	}
++	err = SDIO_READ_EXTENDED(device_get_parent(func->bsd_func->dev), func->num, addr,
++	    sizeof(v), (uint8_t *)&v, true);
+ 	if (err_ret != NULL)
+-		*err_ret = 0;
+-	return (v);
++		*err_ret = err;
++	if (err != 0)
++		return (0);
++	return (le32toh(v));
+ }
+ 
+ void
+ sdio_writel(struct sdio_func *func, unsigned int v, unsigned int addr, int *err_ret)
+ {
+-	struct sdio_func_bsd *nf = func->bsd_func;
+-	int err, i;
+-
+-	for (i = 0; i < 4; i++) {
+-		sdio_write_1_bsd(nf, addr + i, (v >> (8 * i)) & 0xff, &err);
+-		if (err != 0) {
+-			if (err_ret != NULL)
+-				*err_ret = err;
+-			return;
+-		}
+-	}
++	uint32_t lev __aligned(8);
++	int err;
++
++	/* Single 4-byte CMD53, see sdio_readl() above. */
++	lev = htole32(v);
++	err = SDIO_WRITE_EXTENDED(device_get_parent(func->bsd_func->dev), func->num, addr,
++	    sizeof(lev), (uint8_t *)&lev, true);
+ 	if (err_ret != NULL)
+-		*err_ret = 0;
++		*err_ret = err;
+ }
+ 
+ int
+ sdio_memcpy_fromio(struct sdio_func *func, void *dst, unsigned int addr, int count)
+ {
+-	return (SDIO_READ_EXTENDED(func->bsd_func->dev, func->num, addr,
++	return (SDIO_READ_EXTENDED(device_get_parent(func->bsd_func->dev), func->num, addr,
+ 	    count, dst, true));
+ }
+ 
+ int
+ sdio_memcpy_toio(struct sdio_func *func, unsigned int addr, void *src, int count)
+ {
+-	return (SDIO_WRITE_EXTENDED(func->bsd_func->dev, func->num, addr,
++	return (SDIO_WRITE_EXTENDED(device_get_parent(func->bsd_func->dev), func->num, addr,
+ 	    count, src, true));
+ }
+ 
++/*
++ * sdio_readsb()/sdio_writesb() are the Linux *fixed-address* (FIFO) CMD53
++ * variants: incr_addr = 0.  brcmfmac uses sdio_readsb() for every F2
++ * (data/frame) read; forwarding them to the incrementing memcpy variants
++ * would walk the F2 address space instead of draining the FIFO.
++ */
+ int
+ sdio_readsb(struct sdio_func *func, void *dst, unsigned int addr, int count)
+ {
+-	return (sdio_memcpy_fromio(func, dst, addr, count));
++	return (SDIO_READ_EXTENDED(device_get_parent(func->bsd_func->dev), func->num, addr,
++	    count, dst, false));
+ }
+ 
+ int
+ sdio_writesb(struct sdio_func *func, unsigned int addr, void *src, int count)
+ {
+-	return (sdio_memcpy_toio(func, addr, src, count));
++	return (SDIO_WRITE_EXTENDED(device_get_parent(func->bsd_func->dev), func->num, addr,
++	    count, src, false));
+ }
+ 
+ unsigned int
+@@ -493,15 +564,23 @@ sdio_align_size(struct sdio_func *func, unsigned int sz)
+ /* ------------------------------------------------------------------ */
+ 
+ static void
+-lksdio_poll_fn(void *arg)
++lksdio_poll_fn(void *arg, int pending)
+ {
+ 	uint8_t pend;
+ 	int err, fn;
+ 
+-	/* F0 read of the interrupt-pending register; CAM round trip may
+-	 * sleep, so this runs as a plain (lock-free) mpsafe callout. */
+-	if (lksdio_poll_nfunc == NULL)
++	/*
++	 * F0 read of CCCR INT_PEND.  The CAM round trip sleeps, so this is a
++	 * taskqueue timeout task, not a callout.  Like Linux's sdio irq
++	 * thread we hold the host claim across the read *and* the handler
++	 * dispatch: the handler issues its own CMD52/CMD53 and must not
++	 * interleave with the driver's other threads.
++	 */
++	sx_xlock(&lksdio_host_lock);
++	if (!lksdio_poll_on || lksdio_poll_nfunc == NULL) {
++		sx_xunlock(&lksdio_host_lock);
+ 		return;
++	}
+ 	pend = sdio_f0_read_1_bsd(lksdio_poll_nfunc, SDIO_CCCR_INT_PEND, &err);
+ 	if (err == 0 && pend != 0) {
+ 		for (fn = 1; fn <= SDIO_MAX_FUNCS; fn++) {
+@@ -513,8 +592,10 @@ lksdio_poll_fn(void *arg)
+ 				lf->irq_handler(lf);
+ 		}
+ 	}
++	sx_xunlock(&lksdio_host_lock);
+ 	if (lksdio_poll_on)
+-		callout_schedule(&lksdio_poll_callout, LKSDIO_POLL_MS);
++		taskqueue_enqueue_timeout(lksdio_tq, &lksdio_poll_task,
++		    hz * LKSDIO_POLL_MS / 1000);
+ }
+ 
+ int
+@@ -534,8 +615,8 @@ sdio_claim_irq(struct sdio_func *func, sdio_irq_handler_t *handler)
+ 	if (!lksdio_poll_on) {
+ 		lksdio_poll_nfunc = func->bsd_func;
+ 		lksdio_poll_on = true;
+-		callout_reset(&lksdio_poll_callout, LKSDIO_POLL_MS,
+-		    lksdio_poll_fn, NULL);
++		taskqueue_enqueue_timeout(lksdio_tq, &lksdio_poll_task,
++		    hz * LKSDIO_POLL_MS / 1000);
+ 	}
+ 	return (0);
+ }
+@@ -546,6 +627,9 @@ sdio_release_irq(struct sdio_func *func)
+ 	uint8_t ien;
+ 	int err;
+ 
++	int fn;
++	bool any;
++
+ 	func->irq_handler = NULL;
+ 
+ 	ien = sdio_f0_read_1_bsd(func->bsd_func, SDIO_CCCR_INT_EN, &err);
+@@ -553,6 +637,27 @@ sdio_release_irq(struct sdio_func *func)
+ 		ien &= ~(1 << func->num);
+ 		sdio_f0_write_1_bsd(func->bsd_func, SDIO_CCCR_INT_EN, ien, &err);
+ 	}
++	any = false;
++	for (fn = 1; fn <= SDIO_MAX_FUNCS; fn++) {
++		struct sdio_func *lf = lksdio_card.sdio_func[fn - 1];
++
++		if (lf != NULL && lf->irq_handler != NULL)
++			any = true;
++	}
++	if (!any && lksdio_poll_on) {
++		/*
++		 * The caller holds the host claim (brcmfmac does), and the
++		 * task takes it too, so we cannot drain here without
++		 * deadlocking.  Clearing the flag under the claim is enough:
++		 * a task already past its timer blocks on the claim, sees
++		 * !lksdio_poll_on once it gets in and returns without
++		 * touching the card or rescheduling.  lksdio_module_fini()
++		 * does the drain at unload time, unclaimed.
++		 */
++		lksdio_poll_on = false;
++		taskqueue_cancel_timeout(lksdio_tq, &lksdio_poll_task,
++		    NULL);
++	}
+ 	return (0);
+ }
+ 
+@@ -606,6 +711,25 @@ lksdio_init(void *arg)
+ {
+ 
+ 	mtx_init(&lksdio_reg_lock, "lksdio reg", NULL, MTX_DEF);
+-	callout_init(&lksdio_poll_callout, 1);
++	sx_init_flags(&lksdio_host_lock, "lksdio host", SX_RECURSE);
++	lksdio_tq = taskqueue_create("lksdio", M_WAITOK,
++	    taskqueue_thread_enqueue, &lksdio_tq);
++	taskqueue_start_threads(&lksdio_tq, 1, PI_NET, "lksdio irq poll");
++	TIMEOUT_TASK_INIT(lksdio_tq, &lksdio_poll_task, 0,
++	    lksdio_poll_fn, NULL);
+ }
+ SYSINIT(lksdio_init, SI_SUB_DRIVERS, SI_ORDER_ANY, lksdio_init, NULL);
++
++static void
++lksdio_fini(void *arg)
++{
++
++	lksdio_poll_on = false;
++	while (taskqueue_cancel_timeout(lksdio_tq, &lksdio_poll_task,
++	    NULL) != 0)
++		taskqueue_drain_timeout(lksdio_tq, &lksdio_poll_task);
++	taskqueue_free(lksdio_tq);
++	sx_destroy(&lksdio_host_lock);
++	mtx_destroy(&lksdio_reg_lock);
++}
++SYSUNINIT(lksdio_fini, SI_SUB_DRIVERS, SI_ORDER_ANY, lksdio_fini, NULL);

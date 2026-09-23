@@ -1,0 +1,62 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] aw_mmc: do not arm auto-CMD12 for SDIO CMD53 transfers
+
+The controller's automatic CMD12 is armed for any transfer carrying
+MMC_DATA_MULTI.  That is correct for multi-block SD/eMMC read/write from
+mmc_da, which really does issue STOP_TRANSMISSION, but SDIO block-mode
+CMD53 sets the same flag and has no stop command at all: an SDIO card
+never answers CMD12.
+
+The result was that every successful multi-block CMD53 still completed
+with AW_MMC_INT_RESP_TIMEOUT (rint DATA_OVER|AUTO_STOP_DONE|RESP_TIMEOUT),
+which makes any sizeable SDIO transfer impossible -- downloading firmware
+to an SDIO WiFi part could never succeed.
+
+Gate auto-stop on the upper layer actually having supplied a stop opcode,
+which is what Linux's sunxi-mmc does (it keys SDXC_SEND_AUTO_STOP on
+data->stop).
+
+Found while bringing up a BCM43430 SDIO WiFi part on a Banana Pi M64.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/arm/allwinner/aw_mmc.c b/sys/arm/allwinner/aw_mmc.c
+index a8add957d..31d523573 100644
+--- a/sys/arm/allwinner/aw_mmc.c
++++ b/sys/arm/allwinner/aw_mmc.c
+@@ -999,6 +999,7 @@ aw_mmc_request(device_t bus, device_t child, struct mmc_request *req)
+ 	struct aw_mmc_softc *sc;
+ 	struct mmc_command *cmd;
+ 	uint32_t cmdreg, imask;
++	bool auto_stop;
+ 	int err;
+ 
+ 	sc = device_get_softc(bus);
+@@ -1046,7 +1047,26 @@ aw_mmc_request(device_t bus, device_t child, struct mmc_request *req)
+ 	if (cmd->data) {
+ 		cmdreg |= AW_MMC_CMDR_DATA_TRANS | AW_MMC_CMDR_WAIT_PRE_OVER;
+ 
+-		if (cmd->data->flags & MMC_DATA_MULTI) {
++		/*
++		 * Only arm the controller's automatic CMD12 when the upper
++		 * layer actually asked for a STOP_TRANSMISSION.  mmc_da does
++		 * (multi-block SD/eMMC read/write).  SDIO block-mode CMD53
++		 * transfers carry MMC_DATA_MULTI too but have no stop command
++		 * at all -- an SDIO card never answers CMD12, so auto-stop
++		 * turned every successful multi-block CMD53 into an
++		 * AW_MMC_INT_RESP_TIMEOUT (rint DATA_OVER|AUTO_STOP_DONE|
++		 * RESP_TIMEOUT) and made firmware download impossible.
++		 * Linux's sunxi-mmc keys SDXC_SEND_AUTO_STOP on data->stop
++		 * for exactly this reason.
++		 */
++#ifdef MMCCAM
++		auto_stop = (cmd->data->flags & MMC_DATA_MULTI) != 0 &&
++		    sc->ccb->mmcio.stop.opcode != 0;
++#else
++		auto_stop = (cmd->data->flags & MMC_DATA_MULTI) != 0 &&
++		    sc->aw_req->stop != NULL;
++#endif
++		if (auto_stop) {
+ 			cmdreg |= AW_MMC_CMDR_STOP_CMD_FLAG;
+ 			imask |= AW_MMC_INT_AUTO_STOP_DONE;
+ 			sc->aw_intr_wait |= AW_MMC_INT_AUTO_STOP_DONE;

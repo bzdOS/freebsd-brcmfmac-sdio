@@ -1,0 +1,47 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] linuxkpi: skb_header_cloned() must not claim every header is cloned
+
+skb_header_cloned() returned true unconditionally (SKB_TODO).  Callers
+treat that as "the header cannot be written in place" and respond by
+calling pskb_expand_head(), which is itself a stub returning -ENXIO.
+
+For a driver that checks it on the transmit path the combination is fatal:
+brcmfmac's brcmf_netdev_start_xmit() tests
+
+    if (skb_headroom(skb) < drvr->hdrlen || skb_header_cloned(skb))
+            ret = pskb_expand_head(...);
+
+so every single outgoing frame was dropped with -6 before ever reaching
+the hardware, with no diagnostic beyond an incremented tx_dropped.
+
+This KPI has no skb_clone() at all -- nothing ever produces two skbs
+sharing one data buffer -- so false is the truthful answer, not merely the
+convenient one.
+
+pskb_expand_head() is left as it is; with this fixed, callers only reach
+it when the headroom really is too small.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/compat/linuxkpi/common/include/linux/skbuff.h b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+index 9e6f42cd4..68c66eded 100644
+--- a/sys/compat/linuxkpi/common/include/linux/skbuff.h
++++ b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+@@ -1029,8 +1029,15 @@ static inline bool
+ skb_header_cloned(struct sk_buff *skb)
+ {
+ 	SKB_TRACE(skb);
+-	SKB_TODO();
+-	return (true);
++	/*
++	 * This KPI has no skb_clone(): nothing ever produces two skbs
++	 * sharing one data buffer, so a header is never cloned.  Returning
++	 * true (as this did) is not the safe answer -- callers react to it
++	 * by calling pskb_expand_head(), which is still a stub that fails
++	 * with -ENXIO.  brcmfmac's tx path does exactly that on every frame,
++	 * so every single packet was dropped before reaching the radio.
++	 */
++	return (false);
+ }
+ 
+ static inline uint8_t *

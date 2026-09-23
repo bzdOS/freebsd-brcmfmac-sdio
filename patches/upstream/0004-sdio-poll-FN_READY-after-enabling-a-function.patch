@@ -1,0 +1,62 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] sdio: poll FN_READY after enabling a function
+
+sdio_enable_func() set the CCCR IOEx bit and returned immediately.  The
+SDIO specification (5.1) has the card report readiness back through IORx
+(SD_IO_CCCR_FN_READY), which can lag the enable by a noticeable time;
+Linux's sdio_enable_func() polls it for up to a second before returning.
+
+Without the poll a caller can start driving a function that has been told
+to come up but has not yet, and sees bare CMD52 response timeouts with
+nothing to explain them.  On a BCM43430 the readiness bit was observed to
+take 7-21ms for function 2, so this is not a theoretical window.
+
+Poll IORx with a 1ms granularity and a 1s timeout.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/dev/sdio/sdio_subr.c b/sys/dev/sdio/sdio_subr.c
+index f234eb8bd..25504ad9d 100644
+--- a/sys/dev/sdio/sdio_subr.c
++++ b/sys/dev/sdio/sdio_subr.c
+@@ -97,9 +97,38 @@ sdio_set_bool_for_func(device_t dev, uint32_t addr, uint8_t fn, bool enable)
+ int
+ sdio_enable_func(struct sdio_func *f)
+ {
++	device_t pdev;
++	int error;
++	uint8_t val;
++	int timeout_ms = 1000;
+ 
+-	return (sdio_set_bool_for_func(f->dev, SD_IO_CCCR_FN_ENABLE,
+-	    f->fn, true));
++	error = sdio_set_bool_for_func(f->dev, SD_IO_CCCR_FN_ENABLE,
++	    f->fn, true);
++	if (error != 0)
++		return (error);
++
++	/*
++	 * Setting IOEx only asks the card to bring the function up; the SDIO
++	 * spec (5.1) has the card signal readiness back via IORx (CCCR
++	 * SD_IO_CCCR_FN_READY), which can take a while after enable. Linux's
++	 * sdio_enable_func() polls this bit before returning; this one
++	 * didn't, so callers (e.g. brcmfmac's F1 backplane-window writes
++	 * right after enabling F1) could run against a function that had
++	 * been told to come up but hadn't yet, and see plain CMD52 response
++	 * timeouts with no indication why. Poll here instead.
++	 */
++	pdev = device_get_parent(f->dev);
++	for (;;) {
++		error = SDIO_READ_DIRECT(pdev, 0, SD_IO_CCCR_FN_READY, &val);
++		if (error != 0)
++			return (error);
++		if (val & (1 << f->fn))
++			return (0);
++		if (timeout_ms <= 0)
++			return (ETIMEDOUT);
++		DELAY(1000);
++		timeout_ms--;
++	}
+ }
+ 
+ int
