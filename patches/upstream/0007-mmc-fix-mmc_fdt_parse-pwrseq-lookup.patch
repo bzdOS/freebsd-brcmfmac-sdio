@@ -1,0 +1,61 @@
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Subject: [PATCH] mmc: mmc_fdt_parse() never finds mmc-pwrseq for its in-tree callers
+
+mmc_fdt_parse() looks the mmc-pwrseq property up with OF_hasprop(node, ...)
+using the node argument raw. All three in-tree callers pass 0:
+
+  sys/arm/allwinner/aw_mmc.c            mmc_fdt_parse(dev, 0, ...)
+  sys/arm/broadcom/bcm2835/bcm2835_sdhci.c  mmc_fdt_parse(dev, 0, ...)
+  sys/dev/sdhci/sdhci_xenon_fdt.c       mmc_fdt_parse(dev, 0, ...)
+
+so the lookup asks node 0 and mmc-pwrseq is never found, on every one of
+them. A node of 0 meaning "use dev's own node" is the convention the other
+OFW helpers reached from this same function already follow, and
+mmc_fdt_gpio_setup() a little further down this very file has the guard:
+
+	if (node <= 0)
+		node = ofw_bus_get_node(dev);
+
+mmc_fdt_parse() is missing it.
+
+It fails silently, which is what makes it worth fixing rather than merely
+noting: helper->mmc_pwrseq stays NULL, the host driver skips
+MMC_PWRSEQ_SET_POWER() without comment, and a card whose reset line is driven
+by mmc-pwrseq is simply left in reset. Nothing is logged.
+
+Found on a BananaPi M64 (aw_mmc with MMCCAM): the AP6212 SDIO WiFi part's
+WL_REG_ON on PL2 never rose, so the SDIO probe got no answer to CMD0 and the
+card did not enumerate at all.
+
+Add the same guard.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+diff --git a/sys/dev/mmc/mmc_fdt_helpers.c b/sys/dev/mmc/mmc_fdt_helpers.c
+index 980785464..af7e481f0 100644
+--- a/sys/dev/mmc/mmc_fdt_helpers.c
++++ b/sys/dev/mmc/mmc_fdt_helpers.c
+@@ -51,6 +51,23 @@ mmc_fdt_parse(device_t dev, phandle_t node, struct mmc_helper *helper,
+ 	struct mmc_helper mmc_helper;
+ 	phandle_t pwrseq_xref;
+ 
++	/*
++	 * A node of 0 means "use dev's own node" -- the convention every other
++	 * OFW helper called from here already follows (regulator_get_by_ofw_
++	 * property() and gpio_pin_get_by_ofw_property() both accept it). The
++	 * mmc-pwrseq lookup below used `node` raw, so for the three in-tree
++	 * callers that pass 0 -- aw_mmc, bcm2835_sdhci and sdhci_xenon_fdt --
++	 * OF_hasprop() was asking node 0 and mmc-pwrseq was NEVER found. It
++	 * fails silently: helper->mmc_pwrseq stays NULL and the host driver
++	 * simply skips MMC_PWRSEQ_SET_POWER(), so a card whose reset line is
++	 * driven by mmc-pwrseq is left held in reset forever.
++	 *
++	 * Found on a BananaPi M64 (aw_mmc + MMCCAM): the AP6212's WL_REG_ON on
++	 * PL2 never rose, so the SDIO probe got no answer to CMD0.
++	 */
++	if (node <= 0)
++		node = ofw_bus_get_node(dev);
++
+ 	memset(&mmc_helper, 0, sizeof(mmc_helper));
+ 	mmc_parse(dev, &mmc_helper, host);
+ 

@@ -7,3 +7,4 @@
 0004-sdio-poll-FN_READY-after-enabling-a-function.patch
 0005-linuxkpi-zero-the-net_device-driver-private-area.patch
 0006-sdiob-serialise-the-shared-CCB-and-retry-CMD52.patch
+0007-mmc-fix-mmc_fdt_parse-pwrseq-lookup.patch
