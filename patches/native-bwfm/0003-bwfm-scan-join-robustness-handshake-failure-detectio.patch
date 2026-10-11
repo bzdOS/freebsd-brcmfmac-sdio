@@ -1,0 +1,268 @@
+From fa8c76708af7f20152acc27ae8a24db14c088e5b Mon Sep 17 00:00:00 2001
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Date: Sun, 11 Oct 2026 23:10:57 +0300
+Subject: [PATCH 3/3] bwfm: scan/join robustness, handshake failure detection;
+ devd: bwfm is a wifi driver
+
+- end a firmware scan from a timeout instead of immediately when the
+  firmware is down (net80211 roaming restarted it in a tight loop);
+- a join that races with the interface going down returns the vap to
+  INIT (SIOCSIFFLAGS only starts a vap from INIT);
+- E_PSK_SUP with a non-zero reason is a failed handshake (wrong key);
+- host-supplicant join sets the WPA IE after wpa_auth/wsec;
+- devd.conf: add bwfm to wifi-driver-regex so attach runs
+  pccard_ether startchildren (wlans_bwfm0) like any other WiFi driver;
+- ifconfig wpakey: station side keeps open 802.11 authmode (the WPA
+  authmode is the hostap authenticator).
+---
+ sbin/devd/devd.conf         |  2 +-
+ sbin/ifconfig/ifieee80211.c |  6 ++-
+ sys/dev/bwfm/bwfm.c         | 76 +++++++++++++++++++++++++++++++------
+ sys/dev/bwfm/bwfmvar.h      |  1 +
+ sys/dev/bwfm/if_bwfm_sdio.c | 10 ++---
+ 5 files changed, 77 insertions(+), 18 deletions(-)
+
+diff --git a/sbin/devd/devd.conf b/sbin/devd/devd.conf
+index 86faf2f30..4ffb8cde4 100644
+--- a/sbin/devd/devd.conf
++++ b/sbin/devd/devd.conf
+@@ -18,7 +18,7 @@ options {
+ 	# Setup some shorthand for regex that we use later in the file.
+ 	#XXX Yes, this is gross -- imp
+ 	set wifi-driver-regex
+-		"(ath|ath[0-9]+k|bwi|bwn|ipw|iwlwifi|iwi|iwm|iwn|malo|mwl|mt79|mtw|otus|\
++		"(ath|ath[0-9]+k|bwfm|bwi|bwn|ipw|iwlwifi|iwi|iwm|iwn|malo|mwl|mt79|mtw|otus|\
+ 		ral|rsu|rtw|rtwn|rum|run|uath|upgt|ural|urtw|wpi|wtap|zyd)[0-9]+";
+ };
+ 
+diff --git a/sbin/ifconfig/ifieee80211.c b/sbin/ifconfig/ifieee80211.c
+index 104ebb86c..6586fddf8 100644
+--- a/sbin/ifconfig/ifieee80211.c
++++ b/sbin/ifconfig/ifieee80211.c
+@@ -1094,7 +1094,11 @@ wpakey_cb(if_ctx *ctx, void *arg __unused)
+ 		wpakey_pbkdf2(wpakey_arg, ssid, ssidlen, psk);
+ 	}
+ 	explicit_bzero(wpakey_arg, sizeof(wpakey_arg));
+-	set80211(ctx, IEEE80211_IOC_AUTHMODE, IEEE80211_AUTH_WPA, 0, NULL);
++	/*
++	 * Station side: open 802.11 authentication, then WPA/WPA2 (the
++	 * WPA authmode is the hostap authenticator, wlan_xauth).
++	 */
++	set80211(ctx, IEEE80211_IOC_AUTHMODE, IEEE80211_AUTH_OPEN, 0, NULL);
+ 	set80211(ctx, IEEE80211_IOC_WPA, 3, 0, NULL);
+ 	set80211(ctx, IEEE80211_IOC_PRIVACY, 1, 0, NULL);
+ 	set80211(ctx, IEEE80211_IOC_WPAPSK, 0, sizeof(psk), psk);
+diff --git a/sys/dev/bwfm/bwfm.c b/sys/dev/bwfm/bwfm.c
+index 21e06aa77..2363c4865 100644
+--- a/sys/dev/bwfm/bwfm.c
++++ b/sys/dev/bwfm/bwfm.c
+@@ -87,7 +87,7 @@
+ 
+ MALLOC_DEFINE(M_BWFM, "bwfm", "Broadcom FullMAC WiFi");
+ 
+-static SYSCTL_NODE(_hw, OID_AUTO, bwfm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
++SYSCTL_NODE(_hw, OID_AUTO, bwfm, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+     "Broadcom FullMAC WiFi");
+ static int bwfm_debug = 0;
+ SYSCTL_INT(_hw_bwfm, OID_AUTO, debug, CTLFLAG_RWTUN, &bwfm_debug, 0,
+@@ -97,6 +97,7 @@ SYSCTL_INT(_hw_bwfm, OID_AUTO, debug, CTLFLAG_RWTUN, &bwfm_debug, 0,
+ #define DPRINTFN(n, x)	do { if (bwfm_debug >= (n)) printf x; } while (0)
+ 
+ #define	BWFM_JOIN_TIMEOUT	20	/* s */
++#define	BWFM_SCAN_TIMEOUT	15	/* s */
+ #define	BWFM_NOISE_FLOOR	(-95)	/* dBm */
+ 
+ void	 bwfm_chip_ai_disable(struct bwfm_softc *, struct bwfm_core *,
+@@ -1291,6 +1292,7 @@ static void	 bwfm_update_mcast(struct ieee80211com *);
+ static void	 bwfm_update_promisc(struct ieee80211com *);
+ static void	 bwfm_ev_task(void *, int);
+ static void	 bwfm_scan_abort(struct bwfm_softc *);
++static void	 bwfm_scan_timeout(void *, int);
+ 
+ int
+ bwfm_attach(struct bwfm_softc *sc)
+@@ -1305,6 +1307,7 @@ bwfm_attach(struct bwfm_softc *sc)
+ 	    taskqueue_thread_enqueue, &sc->sc_tq);
+ 	taskqueue_start_threads(&sc->sc_tq, 1, PI_NET, "%s taskq",
+ 	    device_get_nameunit(sc->sc_dev));
++	TIMEOUT_TASK_INIT(sc->sc_tq, &sc->sc_scan_to, 0, bwfm_scan_timeout, sc);
+ 	return (0);
+ }
+ 
+@@ -1435,6 +1438,9 @@ bwfm_detach(struct bwfm_softc *sc)
+ 		sc->sc_attached = 0;
+ 	}
+ 	if (sc->sc_tq != NULL) {
++		while (taskqueue_cancel_timeout(sc->sc_tq, &sc->sc_scan_to,
++		    NULL) != 0)
++			taskqueue_drain_timeout(sc->sc_tq, &sc->sc_scan_to);
+ 		taskqueue_drain_all(sc->sc_tq);
+ 		taskqueue_free(sc->sc_tq);
+ 		sc->sc_tq = NULL;
+@@ -1888,13 +1894,18 @@ bwfm_scan_start(struct ieee80211com *ic)
+ 	struct ieee80211_scan_state *ss = ic->ic_scan;
+ 	struct ieee80211vap *vap = ss->ss_vap;
+ 
+-	if (!sc->sc_running) {
+-		ieee80211_scan_done(vap);
+-		return;
+-	}
+ 	BWFM_LOCK(sc);
+ 	sc->sc_scan_vap = vap;
+ 	BWFM_UNLOCK(sc);
++	/*
++	 * End the scan from the timeout if the firmware never reports back
++	 * (or is down: finishing right here would let net80211's roaming
++	 * restart the scan in a tight loop).
++	 */
++	taskqueue_enqueue_timeout(sc->sc_tq, &sc->sc_scan_to,
++	    sc->sc_running ? BWFM_SCAN_TIMEOUT * hz : hz);
++	if (!sc->sc_running)
++		return;
+ 	/*
+ 	 * A passive all-channel escan finds every beaconing network; with
+ 	 * a desired SSID probe for it actively (hidden networks).
+@@ -1905,6 +1916,23 @@ bwfm_scan_start(struct ieee80211com *ic)
+ 		bwfm_escan(sc, NULL, 0, false);
+ }
+ 
++static void
++bwfm_scan_timeout(void *arg, int pending __unused)
++{
++	struct bwfm_softc *sc = arg;
++	struct ieee80211vap *vap;
++
++	BWFM_LOCK(sc);
++	vap = sc->sc_scan_vap;
++	sc->sc_scan_vap = NULL;
++	BWFM_UNLOCK(sc);
++	if (vap != NULL) {
++		if (sc->sc_running)
++			printf("%s: scan timed out\n", DEVNAME(sc));
++		ieee80211_scan_done(vap);
++	}
++}
++
+ static void
+ bwfm_scan_end(struct ieee80211com *ic)
+ {
+@@ -2022,6 +2050,7 @@ bwfm_escan_result(struct bwfm_softc *sc, struct bwfm_event *e, size_t len)
+ 		vap = sc->sc_scan_vap;
+ 		sc->sc_scan_vap = NULL;
+ 		BWFM_UNLOCK(sc);
++		taskqueue_cancel_timeout(sc->sc_tq, &sc->sc_scan_to, NULL);
+ 		if (vap != NULL)
+ 			ieee80211_scan_done(vap);
+ 		return;
+@@ -2140,10 +2169,14 @@ bwfm_connect(struct bwfm_softc *sc, struct ieee80211vap *vap)
+ 		wsec = bwfm_rsn_wsec(ie, &wpa1);
+ 		wpa = wpa1 ? BWFM_WPA_AUTH_WPA_PSK : BWFM_WPA_AUTH_WPA2_PSK;
+ 		bwfm_fwvar_var_set_int(sc, "sup_wpa", 0);
+-		bwfm_fwvar_var_set_data(sc, "wpaie", vap->iv_appie_wpa->ie_data,
+-		    vap->iv_appie_wpa->ie_len);
+ 		bwfm_fwvar_var_set_int(sc, "wpa_auth", wpa);
+ 		bwfm_fwvar_var_set_int(sc, "wsec", wsec);
++		/* After wpa_auth/wsec, which make the firmware build its own. */
++		bwfm_fwvar_var_set_data(sc, "wpaie", vap->iv_appie_wpa->ie_data,
++		    vap->iv_appie_wpa->ie_len);
++		DPRINTF(("%s: host supplicant, IE %*D\n", DEVNAME(sc),
++		    vap->iv_appie_wpa->ie_len, vap->iv_appie_wpa->ie_data,
++		    " "));
+ 	} else if (vap->iv_flags & IEEE80211_F_PRIVACY) {
+ 		bwfm_fwvar_var_set_int(sc, "sup_wpa", 0);
+ 		bwfm_fwvar_var_set_int(sc, "wpa_auth", BWFM_WPA_AUTH_DISABLED);
+@@ -2197,8 +2230,25 @@ bwfm_join_timeout(void *arg)
+ 	struct bwfm_vap *bvap = arg;
+ 	struct ieee80211vap *vap = &bvap->bv_vap;
+ 
+-	printf("%s: join timed out\n", if_name(vap->iv_ifp));
+-	ieee80211_new_state(vap, IEEE80211_S_SCAN, IEEE80211_SCAN_FAIL_TIMEOUT);
++	struct ieee80211com *ic = vap->iv_ic;
++
++	IEEE80211_LOCK(ic);
++	if (vap->iv_state == IEEE80211_S_AUTH ||
++	    vap->iv_state == IEEE80211_S_ASSOC) {
++		if ((if_getdrvflags(vap->iv_ifp) & IFF_DRV_RUNNING) != 0) {
++			printf("%s: join timed out\n", if_name(vap->iv_ifp));
++			ieee80211_new_state_locked(vap, IEEE80211_S_SCAN,
++			    IEEE80211_SCAN_FAIL_TIMEOUT);
++		} else {
++			/*
++			 * A join that raced with the interface going down:
++			 * back to INIT, or SIOCSIFFLAGS would never start
++			 * the vap again (it only starts it from INIT).
++			 */
++			ieee80211_new_state_locked(vap, IEEE80211_S_INIT, 0);
++		}
++	}
++	IEEE80211_UNLOCK(ic);
+ }
+ 
+ static int
+@@ -2239,7 +2289,9 @@ bwfm_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 		if (bvap->bv_join != BWFM_JOIN_IDLE)
+ 			bwfm_fwvar_cmd_set_data(sc, BWFM_C_DISASSOC, NULL, 0);
+ 		bvap->bv_join = BWFM_JOIN_PENDING;
+-		error = sc->sc_running ? bwfm_connect(sc, vap) : ENETDOWN;
++		error = (sc->sc_running &&
++		    (if_getdrvflags(vap->iv_ifp) & IFF_DRV_RUNNING) != 0) ?
++		    bwfm_connect(sc, vap) : ENETDOWN;
+ 		IEEE80211_LOCK(ic);
+ 		if (error != 0) {
+ 			printf("%s: join failed: %d\n", if_name(vap->iv_ifp),
+@@ -2339,9 +2391,11 @@ bwfm_rx_event_cb(struct bwfm_softc *sc, struct mbuf *m)
+ 		if (status == BWFM_E_STATUS_FWSUP_COMPLETED) {
+ 			if (bvap->bv_join != BWFM_JOIN_DONE)
+ 				bwfm_link_up(sc, vap);
+-		} else if (status == BWFM_E_STATUS_FWSUP_TIMEOUT ||
++		} else if (reason != 0 ||
++		    status == BWFM_E_STATUS_FWSUP_TIMEOUT ||
+ 		    status < BWFM_E_STATUS_FWSUP_WAIT_M1 ||
+ 		    status > BWFM_E_STATUS_FWSUP_PREP_G2) {
++			/* e.g. status 8 (waiting for msg 3), reason 14: MIC */
+ 			printf("%s: WPA handshake failed (status %u reason %u)"
+ 			    ", wrong key?\n", if_name(vap->iv_ifp), status,
+ 			    reason);
+diff --git a/sys/dev/bwfm/bwfmvar.h b/sys/dev/bwfm/bwfmvar.h
+index e31395dc9..c58d679da 100644
+--- a/sys/dev/bwfm/bwfmvar.h
++++ b/sys/dev/bwfm/bwfmvar.h
+@@ -179,6 +179,7 @@ struct bwfm_softc {
+ 	struct task		 sc_ev_task;
+ 	struct mbufq		 sc_evq;
+ 	struct task		 sc_attach_task;
++	struct timeout_task	 sc_scan_to;
+ 
+ 	struct ieee80211vap	*sc_vap;	/* the one vap so far */
+ 	int			 sc_rx_busy;
+diff --git a/sys/dev/bwfm/if_bwfm_sdio.c b/sys/dev/bwfm/if_bwfm_sdio.c
+index 2ea1a5bd2..4ad820cb7 100644
+--- a/sys/dev/bwfm/if_bwfm_sdio.c
++++ b/sys/dev/bwfm/if_bwfm_sdio.c
+@@ -401,9 +401,6 @@ bwfm_sdio_attach_task(void *arg, int pending __unused)
+ 		device_printf(bwfm->sc_dev, "firmware start failed\n");
+ 		return;
+ 	}
+-	/* Late attach: let devd(8) run the rc.d path (wlans_bwfmN). */
+-	devctl_notify("IFNET", device_get_nameunit(bwfm->sc_dev), "ATTACH",
+-	    NULL);
+ }
+ 
+ static int
+@@ -512,8 +509,11 @@ bwfm_sdio_attach(device_t dev)
+ 
+ 	/*
+ 	 * Loading the firmware needs the root file system.  When it is
+-	 * there (kldload, rc.d kld_list) finish now, so the com exists when
+-	 * kldload returns; otherwise (loader) finish from a task.
++	 * there (kldload, rc.d kld_list) finish now: the com then exists
++	 * when attach returns, so devd's wifi attach rule (pccard_ether
++	 * startchildren) and rc.d/netif (wlans_bwfm0) can create vaps.
++	 * Otherwise (loaded by the loader) finish from a task once root is
++	 * mounted; use kld_list="if_bwfm" for configuration at boot.
+ 	 */
+ 	if (rootvnode != NULL) {
+ 		if (bwfm_sdio_preinit(bwfm) != 0 || bwfm_preinit(bwfm) != 0)
+-- 
+2.55.0
+
