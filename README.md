@@ -47,7 +47,7 @@ or in rc.conf (with `kld_list="if_bwfm"`, or hot attach through devd):
 
 ```
 wlans_bwfm0="wlan0"
-ifconfig_wlan0="ssid MyNetwork wpakey 'pass phrase' DHCP"
+ifconfig_wlan0="ssid MyNetwork wpakey MyPassphrase DHCP"   # no spaces in rc.conf
 ```
 
 `patches/native-bwfm/` (apply in order on FreeBSD 15.1 with `options MMCCAM`):
