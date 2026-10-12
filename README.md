@@ -1,4 +1,4 @@
-# WiFi on the Banana Pi M64 under FreeBSD (brcmfmac / BCM43430 SDIO)
+# WiFi and Bluetooth on the Banana Pi M64 under FreeBSD (AP6212 / BCM43430)
 
 **The onboard WiFi of the Banana Pi M64 works under FreeBSD.** The AP6212
 module (Broadcom BCM43430, SDIO) associates to a WPA2-PSK access point and
@@ -66,7 +66,37 @@ detection, and the rc.conf path (devd -> `wlans_bwfm0` -> `ifconfig_wlan0`).
 Firmware download takes about 18 s, because the MMCCAM SDIO bus stays at its
 enumeration clock; the boot is not held up by it.
 Not yet: the host-supplicant path (`wpa_supplicant -D bsd` gets message 1 of
-the handshake but the access point never accepts message 2), hostap mode.
+the handshake but the access point never accepts message 2).
+
+## Bluetooth: bcmbt(4), ng_h4(4), bcmbtattach
+
+The Bluetooth half of the same AP6212 module (BCM43438A1, an HCI controller
+on `uart1`) works too: brought up at boot, `hccontrol inquiry` finds a
+laptop, `remote_name_request` returns its name, and `l2ping` gets 5/5 replies
+over an ACL link. FreeBSD had no UART Bluetooth transport since `ng_h4` was
+removed in 79a100e28e3c; `patches/bluetooth/0001` revives it, rewritten on
+the MPSAFE tty hook API.
+
+```
+# kldload bcmbt ng_h4 ng_hci ng_l2cap ng_btsocket
+# bcmbtattach -n h4bt0 -f /boot/firmware/bcm43438a1-ap6212.hcd
+# hccontrol -n h4bt0hci inquiry
+# l2ping -a <bdaddr>
+```
+
+| Piece | |
+| --- | --- |
+| `patches/bluetooth/0001` | `ng_h4(4)`: H4 UART transport node for `ng_hci(4)`, module and man page. |
+| `patches/bluetooth/0002` | `aw_rtc`: register the gated 32 kHz fanout (`<&rtc 1>`), the module's LPO clock. |
+| `patches/bluetooth/0003` | `bcmbt(4)`: claims `brcm,bcm43438-bt` under the UART node and powers the controller (LPO clock, supplies, BT_REG_ON). |
+| `bluetooth/bcmbtattach/` | Userland: power-cycle, patchram load, bind the tty to `ng_h4`, build the hci/l2cap graph. |
+| `bluetooth/rc.d/bcmbt` | Bring-up at boot. |
+
+It needs the module's own patchram, `bcm43438a1.hcd` for the AP6212 (from
+Armbian's firmware repository, not included here); the Raspberry Pi
+`BCM43430A1.hcd` does not work. The link stays at 115200 baud, and nothing
+above L2CAP has been verified. Build, firmware, use and the full list of
+what is and is not verified: `docs/bluetooth.md`.
 
 ## Hardware and software
 
@@ -74,6 +104,7 @@ the handshake but the access point never accepts message 2), hostap mode.
 | --- | --- |
 | Board | Banana Pi M64 (Allwinner A64, arm64) |
 | WiFi | AP6212 module, Broadcom BCM43430/1, SDIO on `mmc1` |
+| Bluetooth | same module, BCM43438A1, `uart1` with RTS/CTS |
 | OS | FreeBSD 15.1-RC3 aarch64, `options MMCCAM` |
 | Firmware | `brcmfmac43430-sdio.bin`, version 7.45.98.118 (Cypress) |
 
@@ -83,9 +114,12 @@ the handshake but the access point never accepts message 2), hostap mode.
 | --- | --- |
 | `patches/upstream/` | Six patches against stock FreeBSD. Each fixes a defect that exists independently of this hardware, is still present in upstream `main`, and applies there unmodified. |
 | `patches/native-bwfm/` | Native bwfm(4) driver (no LinuxKPI), net80211 PSK ioctl, `ifconfig wpakey`. See below. |
+| `patches/bluetooth/` | UART Bluetooth: `ng_h4(4)`, `aw_rtc` 32 kHz fanout, `bcmbt(4)`. Apply in order to FreeBSD 15.1 or `main`. |
+| `bluetooth/` | `bcmbtattach` (patchram loader and tty binder) and `rc.d/bcmbt`. |
 | `patches/wip/` | The netdev↔ifnet bridge, the connect control path, and fixes to this project's own SDIO shim. Needed to make it work; not in a shape to send upstream. |
 | `docs/root-causes.md` | Every blocker, with the evidence that identified it. |
 | `docs/bringup.md` | Build, install and connect. |
+| `docs/bluetooth.md` | Bluetooth: build, firmware, use, status. |
 | `tools/wpa_psk.py` | Offline PMK derivation, so a passphrase never has to enter a sysctl. |
 
 ## What was actually broken
