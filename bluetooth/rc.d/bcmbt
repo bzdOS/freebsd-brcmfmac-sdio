@@ -1,0 +1,70 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2026 Andrey Bodrov <ap.bodrov@gmail.com>
+#
+# bcmbt -- bring up a UART-attached Broadcom Bluetooth controller.
+#
+# bcmbt(4) powers the chip (LPO clock, supplies, BT_REG_ON) from the DT;
+# bcmbtattach(8) loads its patchram, binds the tty to ng_h4(4) and builds the
+# hci/l2cap graph; this script then initialises ng_hci the way
+# /etc/rc.d/bluetooth does for ubt(4) devices (which it does not know).
+#
+# PROVIDE: bcmbt
+# REQUIRE: FILESYSTEMS
+# BEFORE: hcsecd sdpd bthidd
+# KEYWORD: nojail shutdown
+
+. /etc/rc.subr
+
+name="bcmbt"
+desc="UART Broadcom Bluetooth bring-up"
+rcvar="bcmbt_enable"
+start_cmd="bcmbt_start"
+stop_cmd="bcmbt_stop"
+
+load_rc_config $name
+
+: ${bcmbt_enable:="NO"}
+: ${bcmbt_firmware:="/boot/firmware/bcm43438a1-ap6212.hcd"}
+: ${bcmbt_node:="h4bt0"}
+: ${bcmbt_scan:="3"}          # write_scan_enable: 0 none, 1 inquiry, 2 page, 3 both
+: ${bcmbt_flags:=""}          # extra bcmbtattach flags, e.g. "-d /dev/cuau2"
+
+bcmbt_start()
+{
+	local m h i
+
+	for m in bcmbt ng_h4 ng_hci ng_l2cap ng_btsocket; do
+		kldstat -q -m ${m} || kldload -n ${m} || return 1
+	done
+
+	/usr/local/sbin/bcmbtattach ${bcmbt_flags} -n ${bcmbt_node} \
+	    -f ${bcmbt_firmware} || return 1
+
+	h="hccontrol -n ${bcmbt_node}hci"
+	for i in 1 2 3; do
+		${h} reset > /dev/null 2>&1 && break
+		[ ${i} -eq 3 ] && { warn "HCI reset failed three times"; return 1; }
+	done
+	${h} read_bd_addr > /dev/null 2>&1 || return 1
+	${h} read_local_supported_features > /dev/null 2>&1 || return 1
+	${h} read_buffer_size > /dev/null 2>&1 || return 1
+	${h} write_scan_enable ${bcmbt_scan} > /dev/null 2>&1 || return 1
+	# INITED needs the BD_ADDR the reads above taught ng_hci
+	ngctl msg ${bcmbt_node}hci: init > /dev/null 2>&1 || return 1
+	echo "Bluetooth: ${bcmbt_node} $(${h} read_bd_addr | sed 's/BD_ADDR: //')"
+}
+
+bcmbt_stop()
+{
+	local n
+
+	pkill -f "bcmbtattach.* -n ${bcmbt_node} " 2>/dev/null
+	for n in ${bcmbt_node}l2cap ${bcmbt_node}hci ${bcmbt_node}; do
+		ngctl shutdown ${n}: > /dev/null 2>&1
+	done
+}
+
+run_rc_command "$1"

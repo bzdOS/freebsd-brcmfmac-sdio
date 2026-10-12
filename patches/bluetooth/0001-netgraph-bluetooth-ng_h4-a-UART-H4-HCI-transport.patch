@@ -1,0 +1,1168 @@
+From 7ab0fd99aa6974decfa84f5ed5c11d00ee810082 Mon Sep 17 00:00:00 2001
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Date: Sat, 26 Sep 2026 20:54:30 +0300
+Subject: [PATCH 1/3] netgraph/bluetooth: ng_h4, a UART (H4) HCI transport
+
+FreeBSD has had no UART Bluetooth transport since ng_h4 was removed in
+79a100e28e3c; only the USB ubt remains. This is a new node on the MPSAFE tty
+API (ttyhook_register(9), as ng_tty uses): it reassembles the H4 byte stream
+into HCI frames for ng_hci's drv hook and queues frames from it to the tty.
+Bound with NGM_H4_NODE_SET_TTY {pid, fd} from the process holding the tty.
+
+Tested on an Allwinner A64 (Banana Pi M64, AP6212/BCM43438A1 on uart1): after
+a userland patchram load, hccontrol reset/read_bd_addr/features/buffer size,
+inquiry finds a laptop, remote_name_request returns its name, and l2ping gets
+5/5 echo replies (12-34 ms) over an ACL link.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+ share/man/man4/Makefile                       |   1 +
+ share/man/man4/ng_h4.4                        |  90 ++
+ sys/modules/netgraph/bluetooth/Makefile       |   1 +
+ sys/modules/netgraph/bluetooth/h4/Makefile    |  11 +
+ sys/netgraph/bluetooth/drivers/h4/ng_h4.c     | 773 ++++++++++++++++++
+ sys/netgraph/bluetooth/drivers/h4/ng_h4_var.h | 105 +++
+ sys/netgraph/bluetooth/include/ng_h4.h        | 100 +++
+ 7 files changed, 1081 insertions(+)
+ create mode 100644 share/man/man4/ng_h4.4
+ create mode 100644 sys/modules/netgraph/bluetooth/h4/Makefile
+ create mode 100644 sys/netgraph/bluetooth/drivers/h4/ng_h4.c
+ create mode 100644 sys/netgraph/bluetooth/drivers/h4/ng_h4_var.h
+ create mode 100644 sys/netgraph/bluetooth/include/ng_h4.h
+
+diff --git a/share/man/man4/Makefile b/share/man/man4/Makefile
+index c6889c49c..24f2558c3 100644
+--- a/share/man/man4/Makefile
++++ b/share/man/man4/Makefile
+@@ -394,6 +394,7 @@ MAN=	aac.4 \
+ 	ng_frame_relay.4 \
+ 	ng_gif.4 \
+ 	ng_gif_demux.4 \
++	ng_h4.4 \
+ 	ng_hci.4 \
+ 	ng_hole.4 \
+ 	ng_hub.4 \
+diff --git a/share/man/man4/ng_h4.4 b/share/man/man4/ng_h4.4
+new file mode 100644
+index 000000000..feafbc556
+--- /dev/null
++++ b/share/man/man4/ng_h4.4
+@@ -0,0 +1,90 @@
++.\"
++.\" SPDX-License-Identifier: BSD-2-Clause
++.\"
++.\" Copyright (c) 2026 Andrey Bodrov <ap.bodrov@gmail.com>
++.\"
++.Dd September 26, 2026
++.Dt NG_H4 4
++.Os
++.Sh NAME
++.Nm ng_h4
++.Nd Netgraph node type for the Bluetooth H4 UART transport
++.Sh SYNOPSIS
++.In sys/types.h
++.In netgraph/bluetooth/include/ng_h4.h
++.Sh DESCRIPTION
++The
++.Nm h4
++node type turns an open serial port into the transport of a Bluetooth
++controller that speaks the H4 protocol of the
++.Dq UART Transport Layer
++in the Bluetooth Core specification.
++It reassembles the byte stream from the controller into HCI event, ACL
++and SCO packets and passes them to its peer, and writes the packets it
++receives from its peer to the serial port.
++Its single hook is normally connected to the
++.Dq drv
++hook of an
++.Xr ng_hci 4
++node.
++.Pp
++The node attaches to the serial port with
++.Fn ttyhook_register .
++The process that has the port open sends the node an
++.Dv NGM_H4_NODE_SET_TTY
++message carrying its process ID and the file descriptor, and must keep
++the port open for as long as the node is to use it.
++The port must already be configured (speed, flow control) and the
++controller powered and running its firmware; for UART-attached Broadcom
++controllers this is done by
++.Xr bcmbt 4
++and
++.Xr bcmbtattach 8 .
++.Sh HOOKS
++This node type supports the following hook:
++.Bl -tag -width ".Va hook"
++.It Va hook
++Single HCI hook, connected to
++.Xr ng_hci 4 .
++.El
++.Sh CONTROL MESSAGES
++This node type supports the generic control messages, plus the following.
++They have no ASCII form for
++.Xr ngctl 8 ;
++send them in binary with
++.Xr NgSendMsg 3 .
++.Bl -tag -width 3n
++.It Dv NGM_H4_NODE_SET_TTY
++Bind the node to the serial port given as
++.Vt ng_h4_node_set_tty_ep
++.Pq process ID and file descriptor .
++.It Dv NGM_H4_NODE_SET_DEBUG
++Set the debug level
++.Pq Vt ng_h4_node_debug_ep .
++.It Dv NGM_H4_NODE_GET_DEBUG
++Return the debug level.
++.It Dv NGM_H4_NODE_GET_STAT
++Return the packet and byte counters
++.Pq Vt ng_h4_node_stat_ep .
++.It Dv NGM_H4_NODE_RESET_STAT
++Clear the counters.
++.El
++.Sh SHUTDOWN
++This node shuts down upon receipt of an
++.Dv NGM_SHUTDOWN
++control message; it detaches from the serial port.
++.Sh SEE ALSO
++.Xr bcmbt 4 ,
++.Xr netgraph 4 ,
++.Xr ng_hci 4 ,
++.Xr ng_tty 4 ,
++.Xr bcmbtattach 8 ,
++.Xr ngctl 8
++.Sh HISTORY
++An earlier
++.Nm
++node, built on the line discipline interface, was removed in
++.Fx 14.0 .
++This implementation uses the MPSAFE tty hook interface.
++.Sh AUTHORS
++.An Andrey Bodrov Aq Mt ap.bodrov@gmail.com
+diff --git a/sys/modules/netgraph/bluetooth/Makefile b/sys/modules/netgraph/bluetooth/Makefile
+index 2587dac65..d145361ee 100644
+--- a/sys/modules/netgraph/bluetooth/Makefile
++++ b/sys/modules/netgraph/bluetooth/Makefile
+@@ -2,6 +2,7 @@
+ 
+ SUBDIR=	\
+ 	bluetooth \
++	h4	\
+ 	hci	\
+ 	l2cap	\
+ 	socket	\
+diff --git a/sys/modules/netgraph/bluetooth/h4/Makefile b/sys/modules/netgraph/bluetooth/h4/Makefile
+new file mode 100644
+index 000000000..1e22128bd
+--- /dev/null
++++ b/sys/modules/netgraph/bluetooth/h4/Makefile
+@@ -0,0 +1,11 @@
++# ng_h4 -- Bluetooth H4 UART transport netgraph node.
++
++.PATH: ${SRCTOP}/sys/netgraph/bluetooth/drivers/h4
++
++CFLAGS+=	-I${SRCTOP}/sys/netgraph/bluetooth/include \
++		-I${SRCTOP}/sys/netgraph/bluetooth/drivers/h4
++
++KMOD=		ng_h4
++SRCS=		ng_h4.c
++
++.include <bsd.kmod.mk>
+diff --git a/sys/netgraph/bluetooth/drivers/h4/ng_h4.c b/sys/netgraph/bluetooth/drivers/h4/ng_h4.c
+new file mode 100644
+index 000000000..f044eb686
+--- /dev/null
++++ b/sys/netgraph/bluetooth/drivers/h4/ng_h4.c
+@@ -0,0 +1,773 @@
++/*
++ * ng_h4.c
++ */
++
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Andrey Bodrov <ap.bodrov@gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * ng_h4(4) -- Bluetooth H4 UART transport.
++ *
++ * This node attaches to an already-open tty via ttyhook_register(9), the
++ * same MPSAFE tty API ng_tty(4) uses.  It has a single hook, normally
++ * connected to ng_hci(4)'s "drv" hook.
++ *
++ * Wire format (Bluetooth Core spec, "UART Transport Layer" / H4): every
++ * frame starts with a single packet-indicator byte, one of
++ *
++ *	NG_HCI_CMD_PKT		0x01	command, host -> controller only
++ *	NG_HCI_ACL_DATA_PKT	0x02	ACL data, either direction
++ *	NG_HCI_SCO_DATA_PKT	0x03	SCO data, either direction
++ *	NG_HCI_EVENT_PKT	0x04	event, controller -> host only
++ *
++ * followed by a type-specific fixed header that ends in a length field,
++ * followed by that many bytes of payload.  ng_hci.h's ng_hci_cmd_pkt_t /
++ * ng_hci_acldata_pkt_t / ng_hci_scodata_pkt_t / ng_hci_event_pkt_t already
++ * describe these headers *including* the indicator byte, and their "type"
++ * values already match the wire values above -- ng_ubt.c prepends these
++ * same indicator bytes onto mbufs before handing them to ng_hci.  So an
++ * mbuf handed to/from ng_hci here is in exactly the form it
++ * needs to be in on the wire; no repacking, only stream reassembly.
++ *
++ * We never originate or expect NG_HCI_CMD_PKT on the receive (tty -> HCI)
++ * side -- only the controller-to-host types (ACL/SCO/EVENT) are legal
++ * there.  A byte that isn't a legal indicator where the reassembler
++ * expects one is treated as a framing error: the byte is dropped and we
++ * stay waiting for the next indicator.  There is no way to recover framing
++ * lost *inside* a header or payload other than starting over at the next
++ * byte that happens to look like an indicator, which may itself be wrong.
++ *
++ * NOTE ON LOCKING: this node runs in two contexts.
++ *
++ * 1) tty context.  ngh4_rint()/ngh4_rint_bypass() (receive) and
++ *    ngh4_getc_inject()/ngh4_getc_poll() (transmit) are called by the tty
++ *    layer with the tty locked (tty_assert_locked()).  All of the RX
++ *    reassembly state in sc (rx_*) is touched *only* from this context,
++ *    so it needs no lock of its own -- the tty lock already serializes
++ *    it, exactly as ng_tty.c's per-mbuf RX state is tty-lock-serialized.
++ *
++ * 2) Netgraph context.  ngh4_rcvdata() (frames arriving from ng_hci to be
++ *    transmitted) runs here, and reaches into the tty to call
++ *    ttydevsw_outwakeup() -- i.e. it *enters* tty context, which is why
++ *    ngh4_connect() forces our own hook into queuing mode
++ *    (NG_HOOK_FORCE_QUEUE()), exactly as ng_tty.c's ngt_connect() does:
++ *    it keeps us from being called with some other node's WRITER lock
++ *    held while we go touch the tty.
++ *
++ * sc->outq (outgoing frames waiting for the tty) is the only field shared
++ * between contexts 1 and 2 (getc_inject/getc_poll dequeue it from tty
++ * context, rcvdata enqueues it from Netgraph context), so it alone gets
++ * a lock: its own embedded ifq_mtx (see NGH4LOCK()), exactly as
++ * ng_tty.c's outq+ifq_mtx.
++ *
++ * sc->tp and sc->hook are set once (SET_TTY message, newhook) and cleared
++ * once (shutdown, disconnect); ng_tty.c accepts the same small race on tp.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/endian.h>
++#include <sys/fcntl.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <sys/mbuf.h>
++#include <sys/mutex.h>
++#include <sys/priv.h>
++#include <sys/proc.h>
++#include <sys/socket.h>
++#include <sys/syslog.h>
++#include <sys/tty.h>
++
++#include <net/if.h>
++#include <net/if_var.h>
++
++#include <netgraph/ng_message.h>
++#include <netgraph/netgraph.h>
++#include <netgraph/bluetooth/include/ng_hci.h>
++#include <netgraph/bluetooth/include/ng_h4.h>
++#include <netgraph/bluetooth/drivers/h4/ng_h4_var.h>
++
++/* Netgraph node methods */
++static ng_constructor_t	ngh4_constructor;
++static ng_rcvmsg_t		ngh4_rcvmsg;
++static ng_shutdown_t		ngh4_shutdown;
++static ng_newhook_t		ngh4_newhook;
++static ng_connect_t		ngh4_connect;
++static ng_rcvdata_t		ngh4_rcvdata;
++static ng_disconnect_t		ngh4_disconnect;
++
++#define	ERROUT(x)		do { error = (x); goto done; } while (0)
++
++/* ttyhook methods */
++static th_getc_inject_t	ngh4_getc_inject;
++static th_getc_poll_t		ngh4_getc_poll;
++static th_rint_t		ngh4_rint;
++static th_rint_bypass_t	ngh4_rint_bypass;
++static th_rint_poll_t		ngh4_rint_poll;
++
++static struct ttyhook ngh4_hook = {
++	.th_getc_inject = ngh4_getc_inject,
++	.th_getc_poll	= ngh4_getc_poll,
++	.th_rint	= ngh4_rint,
++	.th_rint_bypass	= ngh4_rint_bypass,
++	.th_rint_poll	= ngh4_rint_poll,
++};
++
++/* Netgraph node type descriptor */
++static struct ng_type typestruct = {
++	.version	= NG_ABI_VERSION,
++	.name		= NG_H4_NODE_TYPE,
++	.constructor	= ngh4_constructor,
++	.rcvmsg		= ngh4_rcvmsg,
++	.shutdown	= ngh4_shutdown,
++	.newhook	= ngh4_newhook,
++	.connect	= ngh4_connect,
++	.rcvdata	= ngh4_rcvdata,
++	.disconnect	= ngh4_disconnect,
++};
++NETGRAPH_INIT(h4, &typestruct);
++
++/******************************************************************
++			RX (tty -> HCI) FRAMING
++******************************************************************/
++
++/*
++ * Is "type" a legal H4 indicator byte for a frame arriving *from* the
++ * controller?  NG_HCI_CMD_PKT is deliberately excluded: this host never
++ * receives commands.
++ */
++static __inline int
++ngh4_rx_type_valid(uint8_t type)
++{
++
++	return (type == NG_HCI_ACL_DATA_PKT || type == NG_HCI_SCO_DATA_PKT ||
++	    type == NG_HCI_EVENT_PKT);
++}
++
++/*
++ * Fixed header length for "type", indicator byte included.  Only valid
++ * for the three types ngh4_rx_type_valid() accepts.
++ */
++static __inline uint8_t
++ngh4_hdrlen(uint8_t type)
++{
++
++	switch (type) {
++	case NG_HCI_ACL_DATA_PKT:
++		return (sizeof(ng_hci_acldata_pkt_t));
++	case NG_HCI_SCO_DATA_PKT:
++		return (sizeof(ng_hci_scodata_pkt_t));
++	case NG_HCI_EVENT_PKT:
++		return (sizeof(ng_hci_event_pkt_t));
++	default:
++		return (0);
++	}
++} /* ngh4_hdrlen */
++
++/*
++ * Payload length out of a just-completed header.  sc->rx_m's first mbuf
++ * is guaranteed to hold the whole header contiguously: we always give a
++ * fresh frame a full cluster (see ngh4_rx_newframe()), and the longest
++ * header (ACL, 5 bytes) is far smaller than MCLBYTES.
++ */
++static uint16_t
++ngh4_hdr_paylen(sc_p sc)
++{
++
++	switch (sc->rx_type) {
++	case NG_HCI_ACL_DATA_PKT:
++		return (le16toh(mtod(sc->rx_m,
++		    ng_hci_acldata_pkt_t *)->length));
++	case NG_HCI_SCO_DATA_PKT:
++		return (mtod(sc->rx_m, ng_hci_scodata_pkt_t *)->length);
++	case NG_HCI_EVENT_PKT:
++		return (mtod(sc->rx_m, ng_hci_event_pkt_t *)->length);
++	default:
++		return (0);
++	}
++} /* ngh4_hdr_paylen */
++
++/*
++ * Throw away whatever frame is in progress and go back to waiting for a
++ * fresh indicator byte.  tty context.
++ */
++static void
++ngh4_rx_abort(sc_p sc)
++{
++
++	if (sc->rx_m != NULL) {
++		m_freem(sc->rx_m);
++		sc->rx_m = sc->rx_last = NULL;
++	}
++	sc->rx_state = NGH4_ST_W4_PKT_TYPE;
++} /* ngh4_rx_abort */
++
++/*
++ * Start reassembling a new frame whose indicator byte is "type" (already
++ * validated by the caller).  Always allocates a full cluster up front --
++ * simpler and more robust than growing the very first mbuf byte by byte,
++ * and big enough that the (small) header is always contiguous.  Returns
++ * 0 on success, an errno on allocation failure (caller stays in
++ * NGH4_ST_W4_PKT_TYPE and drops the byte).
++ */
++static int
++ngh4_rx_newframe(sc_p sc, uint8_t type)
++{
++	struct mbuf *m;
++
++	MGETHDR(m, M_NOWAIT, MT_DATA);
++	if (m == NULL)
++		return (ENOBUFS);
++	if (!MCLGET(m, M_NOWAIT)) {
++		m_freem(m);
++		return (ENOBUFS);
++	}
++	m->m_pkthdr.rcvif = NULL;
++	m->m_len = m->m_pkthdr.len = 0;
++
++	sc->rx_m = sc->rx_last = m;
++	sc->rx_type = type;
++	sc->rx_hdrlen = ngh4_hdrlen(type);
++	sc->rx_need = 0;
++	sc->rx_state = NGH4_ST_W4_HDR;
++
++	*mtod(m, uint8_t *) = type;
++	m->m_len = m->m_pkthdr.len = 1;
++
++	return (0);
++} /* ngh4_rx_newframe */
++
++/*
++ * Append one byte to the frame being reassembled, growing the mbuf chain
++ * if the current tail is full.  Returns 0 on success, an errno on
++ * allocation failure (caller aborts the frame via ngh4_rx_abort()).
++ */
++static int
++ngh4_rx_putc(sc_p sc, uint8_t c)
++{
++	struct mbuf *m = sc->rx_last;
++
++	if (M_TRAILINGSPACE(m) == 0) {
++		struct mbuf *n;
++
++		MGET(n, M_NOWAIT, MT_DATA);
++		if (n == NULL)
++			return (ENOBUFS);
++		if (!MCLGET(n, M_NOWAIT)) {
++			m_free(n);
++			return (ENOBUFS);
++		}
++		n->m_len = 0;
++		m->m_next = n;
++		sc->rx_last = m = n;
++	}
++
++	*(mtod(m, uint8_t *) + m->m_len) = c;
++	m->m_len++;
++	sc->rx_m->m_pkthdr.len++;
++
++	return (0);
++} /* ngh4_rx_putc */
++
++/*
++ * A full frame has been reassembled in sc->rx_m: hand it to our peer (if
++ * any) and go back to waiting for the next indicator byte.  tty context;
++ * NG_SEND_DATA_ONLY() queues rather than calling straight through, same
++ * as ng_tty.c's ngt_rint() does from this same context.
++ */
++static void
++ngh4_rx_deliver(sc_p sc)
++{
++	struct mbuf *m = sc->rx_m;
++	int error;
++
++	sc->rx_m = sc->rx_last = NULL;
++	sc->rx_state = NGH4_ST_W4_PKT_TYPE;
++
++	NGH4_STAT_PCKTS_RECV(sc);
++	NGH4_STAT_BYTES_RECV(sc, m->m_pkthdr.len);
++
++	if (sc->hook == NULL) {
++		NG_FREE_M(m);
++		return;
++	}
++
++	NG_SEND_DATA_ONLY(error, sc->hook, m);
++	if (error != 0)
++		NGH4_STAT_IERROR(sc);
++} /* ngh4_rx_deliver */
++
++/*
++ * Feed one byte from the wire through the reassembly state machine.
++ * tty context, tty locked.
++ */
++static void
++ngh4_input(sc_p sc, uint8_t c)
++{
++
++	switch (sc->rx_state) {
++	case NGH4_ST_W4_PKT_TYPE:
++		if (!ngh4_rx_type_valid(c)) {
++			NGH4_STAT_IERROR(sc);
++			NGH4_INFO(sc, "unexpected byte 0x%02x while waiting "
++			    "for an H4 packet indicator, dropped\n", c);
++			break;
++		}
++		if (ngh4_rx_newframe(sc, c) != 0) {
++			NGH4_STAT_IERROR(sc);
++			NGH4_ERR(sc, "no mbufs, dropped indicator 0x%02x\n",
++			    c);
++			/* stays in NGH4_ST_W4_PKT_TYPE */
++		}
++		break;
++
++	case NGH4_ST_W4_HDR:
++		if (ngh4_rx_putc(sc, c) != 0) {
++			NGH4_STAT_IERROR(sc);
++			ngh4_rx_abort(sc);
++			break;
++		}
++		if ((uint8_t)sc->rx_m->m_pkthdr.len < sc->rx_hdrlen)
++			break;		/* still need more header bytes */
++
++		sc->rx_need = ngh4_hdr_paylen(sc);
++		if (sc->rx_need == 0)
++			ngh4_rx_deliver(sc);
++		else
++			sc->rx_state = NGH4_ST_W4_DATA;
++		break;
++
++	case NGH4_ST_W4_DATA:
++		if (ngh4_rx_putc(sc, c) != 0) {
++			NGH4_STAT_IERROR(sc);
++			ngh4_rx_abort(sc);
++			break;
++		}
++		sc->rx_need--;
++		if (sc->rx_need == 0)
++			ngh4_rx_deliver(sc);
++		break;
++
++	default:
++		panic("%s: bad rx_state %d", __func__, sc->rx_state);
++	}
++} /* ngh4_input */
++
++/******************************************************************
++			NETGRAPH NODE METHODS
++******************************************************************/
++
++/*
++ * A node may only be created explicitly (ngctl mkpeer/mknod); it starts
++ * out unbound to any tty until an NGM_H4_NODE_SET_TTY message arrives.
++ */
++static int
++ngh4_constructor(node_p node)
++{
++	sc_p sc;
++
++	sc = malloc(sizeof(*sc), M_NETGRAPH, M_WAITOK | M_ZERO);
++
++	NG_NODE_SET_PRIVATE(node, sc);
++	sc->node = node;
++	sc->rx_state = NGH4_ST_W4_PKT_TYPE;
++
++	mtx_init(&sc->outq.ifq_mtx, "ng_h4 node+queue", NULL, MTX_DEF);
++	IFQ_SET_MAXLEN(&sc->outq, ifqmaxlen);
++
++	return (0);
++} /* ngh4_constructor */
++
++/*
++ * There is exactly one hook, named NG_H4_HOOK ("hook"), normally
++ * connected to ng_hci(4)'s "drv" hook by the operator (ngctl).
++ */
++static int
++ngh4_newhook(node_p node, hook_p hook, const char *name)
++{
++	const sc_p sc = NG_NODE_PRIVATE(node);
++
++	if (strcmp(name, NG_H4_HOOK) != 0)
++		return (EINVAL);
++	if (sc->hook != NULL)
++		return (EISCONN);
++
++	NGH4LOCK(sc);
++	sc->hook = hook;
++	NGH4UNLOCK(sc);
++
++	return (0);
++} /* ngh4_newhook */
++
++/*
++ * Force our own hook into queuing mode so that frames arriving from
++ * ng_hci are delivered to ngh4_rcvdata() from the Netgraph queue-worker
++ * thread rather than synchronously from inside ng_hci's own call stack
++ * (which may be holding that node's WRITER lock) -- see the big comment
++ * at the top of this file.  Same as ng_tty.c's ngt_connect().
++ */
++static int
++ngh4_connect(hook_p hook)
++{
++
++	NG_HOOK_FORCE_QUEUE(hook);
++	return (0);
++} /* ngh4_connect */
++
++static int
++ngh4_disconnect(hook_p hook)
++{
++	const sc_p sc = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
++
++	if (hook != sc->hook)
++		panic("%s", __func__);
++
++	NGH4LOCK(sc);
++	sc->hook = NULL;
++	IF_DRAIN(&sc->outq);
++	sc->outqlen = 0;
++	NGH4UNLOCK(sc);
++
++	return (0);
++} /* ngh4_disconnect */
++
++/*
++ * Detach from the tty (if bound) and free everything.  No ng_h4 lock is
++ * held across ttyhook_unregister(): it wants the tty locked instead, and
++ * like ng_tty.c's ngt_shutdown(), we rely on it and tty_rel_free() to
++ * leave the tty unlocked.
++ */
++static int
++ngh4_shutdown(node_p node)
++{
++	const sc_p sc = NG_NODE_PRIVATE(node);
++	struct tty *tp;
++
++	tp = sc->tp;
++	if (tp != NULL) {
++		tty_lock(tp);
++		ttyhook_unregister(tp);
++	}
++
++	ngh4_rx_abort(sc);
++	IF_DRAIN(&sc->outq);
++	mtx_destroy(&sc->outq.ifq_mtx);
++	NG_NODE_UNREF(sc->node);
++	free(sc, M_NETGRAPH);
++
++	return (0);
++} /* ngh4_shutdown */
++
++static int
++ngh4_rcvmsg(node_p node, item_p item, hook_p lasthook)
++{
++	const sc_p sc = NG_NODE_PRIVATE(node);
++	struct ng_mesg *msg, *resp = NULL;
++	struct proc *p;
++	int error = 0;
++
++	NGI_GET_MSG(item, msg);
++	switch (msg->header.typecookie) {
++	case NGM_GENERIC_COOKIE:
++		switch (msg->header.cmd) {
++		case NGM_TEXT_STATUS:
++			NG_MKRESPONSE(resp, msg, NG_TEXTRESPONSE, M_NOWAIT);
++			if (resp == NULL)
++				ERROUT(ENOMEM);
++
++			snprintf(resp->data, NG_TEXTRESPONSE,
++			    "tty: %s\n"
++			    "debug: %d\n"
++			    "outq: [have:%zd bytes]\n"
++			    "stats: recv %u pkts/%u bytes, "
++			    "sent %u pkts/%u bytes, ierrs %u, oerrs %u",
++			    (sc->tp != NULL) ? tty_devname(sc->tp) : "-",
++			    sc->debug, sc->outqlen,
++			    sc->stat.pckts_recv, sc->stat.bytes_recv,
++			    sc->stat.pckts_sent, sc->stat.bytes_sent,
++			    sc->stat.ierrors, sc->stat.oerrors);
++			break;
++
++		default:
++			ERROUT(EINVAL);
++		}
++		break;
++
++	case NGM_H4_COOKIE:
++		switch (msg->header.cmd) {
++		case NGM_H4_NODE_SET_TTY:
++		    {
++			ng_h4_node_set_tty_ep *ep;
++
++			if (sc->tp != NULL)
++				ERROUT(EBUSY);
++			if (msg->header.arglen != sizeof(*ep))
++				ERROUT(EINVAL);
++			ep = (ng_h4_node_set_tty_ep *)msg->data;
++
++			p = pfind(ep->pid);
++			if (p == NULL || (p->p_flag & P_WEXIT))
++				ERROUT(ESRCH);
++			_PHOLD(p);
++			PROC_UNLOCK(p);
++			error = ttyhook_register(&sc->tp, p, ep->fd,
++			    &ngh4_hook, sc);
++			PRELE(p);
++			if (error != 0)
++				ERROUT(error);
++			break;
++		    }
++
++		case NGM_H4_NODE_SET_DEBUG:
++			if (msg->header.arglen != sizeof(ng_h4_node_debug_ep))
++				ERROUT(EINVAL);
++			sc->debug = *(ng_h4_node_debug_ep *)msg->data;
++			break;
++
++		case NGM_H4_NODE_GET_DEBUG:
++			NG_MKRESPONSE(resp, msg,
++			    sizeof(ng_h4_node_debug_ep), M_NOWAIT);
++			if (resp == NULL)
++				ERROUT(ENOMEM);
++			*(ng_h4_node_debug_ep *)resp->data = sc->debug;
++			break;
++
++		case NGM_H4_NODE_GET_STAT:
++			NG_MKRESPONSE(resp, msg,
++			    sizeof(ng_h4_node_stat_ep), M_NOWAIT);
++			if (resp == NULL)
++				ERROUT(ENOMEM);
++			*(ng_h4_node_stat_ep *)resp->data = sc->stat;
++			break;
++
++		case NGM_H4_NODE_RESET_STAT:
++			NGH4_STAT_RESET(sc);
++			break;
++
++		default:
++			ERROUT(EINVAL);
++		}
++		break;
++
++	default:
++		ERROUT(EINVAL);
++	}
++done:
++	NG_RESPOND_MSG(error, node, item, resp);
++	NG_FREE_MSG(msg);
++	return (error);
++} /* ngh4_rcvmsg */
++
++/*
++ * A frame from ng_hci, ready to go to the controller.  It already starts
++ * with the H4 indicator byte (see the file header comment) -- queue it
++ * whole and let ngh4_getc_inject() hand it to the tty a chunk at a time.
++ * Netgraph context.
++ */
++static int
++ngh4_rcvdata(hook_p hook, item_p item)
++{
++	const sc_p sc = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
++	struct tty *tp;
++	struct mbuf *m;
++	uint8_t type;
++
++	if (hook != sc->hook) {
++		NG_FREE_ITEM(item);
++		return (EINVAL);
++	}
++
++	NGI_GET_M(item, m);
++	NG_FREE_ITEM(item);
++
++	if (m->m_pkthdr.len < 1) {
++		NGH4_STAT_OERROR(sc);
++		NG_FREE_M(m);
++		return (EINVAL);
++	}
++
++	type = *mtod(m, uint8_t *);
++	switch (type) {
++	case NG_HCI_CMD_PKT:
++	case NG_HCI_ACL_DATA_PKT:
++	case NG_HCI_SCO_DATA_PKT:
++		break;
++	default:
++		NGH4_STAT_OERROR(sc);
++		NGH4_ERR(sc, "dropping outgoing frame with bad HCI packet "
++		    "type 0x%02x, pktlen=%d\n", type, m->m_pkthdr.len);
++		NG_FREE_M(m);
++		return (EINVAL);
++	}
++
++	tp = sc->tp;
++	if (tp == NULL) {
++		NGH4_STAT_OERROR(sc);
++		NG_FREE_M(m);
++		return (ENXIO);
++	}
++
++	NGH4LOCK(sc);
++	if (_IF_QFULL(&sc->outq)) {
++		NGH4_STAT_OERROR(sc);
++		NGH4UNLOCK(sc);
++		NG_FREE_M(m);
++		return (ENOBUFS);
++	}
++	_IF_ENQUEUE(&sc->outq, m);
++	sc->outqlen += m->m_pkthdr.len;
++	NGH4_STAT_PCKTS_SENT(sc);
++	NGH4_STAT_BYTES_SENT(sc, m->m_pkthdr.len);
++	NGH4UNLOCK(sc);
++
++	/* Wake the tty so it pulls the frame via ngh4_getc_inject() */
++	tty_lock(tp);
++	if (!tty_gone(tp))
++		ttydevsw_outwakeup(tp);
++	tty_unlock(tp);
++
++	return (0);
++} /* ngh4_rcvdata */
++
++/******************************************************************
++			TTYHOOK METHODS
++******************************************************************/
++
++/*
++ * Pull up to "len" bytes of outgoing H4 frame(s) into the tty's own
++ * output buffer.  Identical in shape to ng_tty.c's ngt_getc_inject();
++ * differs only in that our mbufs are ngh4_softc's, not ngt_softc's.
++ * tty context, tty locked.
++ */
++static size_t
++ngh4_getc_inject(struct tty *tp, void *buf, size_t len)
++{
++	sc_p sc = ttyhook_softc(tp);
++	size_t total = 0;
++	int length;
++
++	while (len) {
++		struct mbuf *m;
++
++		IF_DEQUEUE(&sc->outq, m);
++		if (m == NULL)
++			break;
++
++		while (m != NULL) {
++			length = min(m->m_len, len);
++			memcpy((char *)buf + total, mtod(m, char *), length);
++
++			m->m_data += length;
++			m->m_len -= length;
++			total += length;
++			len -= length;
++
++			if (m->m_len > 0)
++				break;	/* tty is full for now */
++			m = m_free(m);
++		}
++
++		if (m != NULL) {
++			IF_PREPEND(&sc->outq, m);
++			break;
++		}
++	}
++
++	NGH4LOCK(sc);
++	sc->outqlen -= total;
++	NGH4UNLOCK(sc);
++
++	return (total);
++} /* ngh4_getc_inject */
++
++static size_t
++ngh4_getc_poll(struct tty *tp)
++{
++	sc_p sc = ttyhook_softc(tp);
++
++	return (sc->outqlen);
++} /* ngh4_getc_poll */
++
++/*
++ * Optimized (bypass) receive: the tty driver hands us a whole buffer of
++ * newly-arrived bytes at once instead of one th_rint() call per byte.
++ * Just run each byte through the same reassembler ngh4_rint() uses.
++ * tty context, tty locked.
++ */
++static size_t
++ngh4_rint_bypass(struct tty *tp, const void *buf, size_t len)
++{
++	sc_p sc = ttyhook_softc(tp);
++	const uint8_t *p = buf;
++	size_t i;
++
++	tty_assert_locked(tp);
++
++	if (sc->hook == NULL)
++		return (0);
++
++	for (i = 0; i < len; i++)
++		ngh4_input(sc, p[i]);
++
++	return (len);
++} /* ngh4_rint_bypass */
++
++/*
++ * Non-bypass receive: one byte at a time, with line-error flags.
++ * tty context, tty locked.
++ */
++static int
++ngh4_rint(struct tty *tp, char c, int flags)
++{
++	sc_p sc = ttyhook_softc(tp);
++
++	tty_assert_locked(tp);
++
++	if (sc->hook == NULL)
++		return (0);
++
++	if (flags != 0) {
++		/* Framing error or overrun: the byte itself is suspect */
++		NGH4_STAT_IERROR(sc);
++		NGH4_WARN(sc, "line error %#x, resyncing\n", flags);
++		ngh4_rx_abort(sc);
++		return (0);
++	}
++
++	ngh4_input(sc, (uint8_t)c);
++	return (0);
++} /* ngh4_rint */
++
++static size_t
++ngh4_rint_poll(struct tty *tp)
++{
++
++	/* We can always accept input -- reassembly never blocks */
++	return (1);
++} /* ngh4_rint_poll */
+diff --git a/sys/netgraph/bluetooth/drivers/h4/ng_h4_var.h b/sys/netgraph/bluetooth/drivers/h4/ng_h4_var.h
+new file mode 100644
+index 000000000..37f647013
+--- /dev/null
++++ b/sys/netgraph/bluetooth/drivers/h4/ng_h4_var.h
+@@ -0,0 +1,105 @@
++/*
++ * ng_h4_var.h
++ */
++
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Andrey Bodrov <ap.bodrov@gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#ifndef _NG_H4_VAR_H_
++#define	_NG_H4_VAR_H_	1
++
++/*
++ * Receive-side (tty -> HCI) reassembly state.  Entered/left only from tty
++ * context (ngh4_rint()/ngh4_rint_bypass()), which the tty layer already
++ * serializes for us (tty_assert_locked()) -- see the big comment in
++ * ng_h4.c.  No separate lock protects these fields.
++ */
++enum ngh4_rxstate {
++	NGH4_ST_W4_PKT_TYPE = 0,	/* waiting for the 1-byte H4 indicator */
++	NGH4_ST_W4_HDR,			/* accumulating the fixed per-type header */
++	NGH4_ST_W4_DATA			/* accumulating the payload */
++};
++
++/* Per-node private info */
++struct ngh4_softc {
++	struct tty	*tp;		/* Terminal device, or NULL if unbound */
++	node_p		node;		/* Netgraph node */
++	hook_p		hook;		/* The (single) Netgraph hook, "hook" */
++
++	struct ifqueue	outq;		/* HCI frames queued for the tty, each
++					   mbuf already starts with the H4
++					   packet indicator byte.  Its own
++					   ifq_mtx (initialized by us, like
++					   ng_tty.c does) is the only lock
++					   this node uses -- see NGH4LOCK(). */
++	size_t		outqlen;	/* bytes currently in outq */
++
++	/* RX reassembly -- tty context only, see ngh4_rxstate above */
++	enum ngh4_rxstate rx_state;
++	uint8_t		rx_type;	/* H4 indicator of the frame in progress */
++	uint8_t		rx_hdrlen;	/* expected header length for rx_type,
++					   including the indicator byte */
++	uint16_t	rx_need;	/* payload bytes still wanted (W4_DATA) */
++	struct mbuf	*rx_m;		/* frame being assembled (head) */
++	struct mbuf	*rx_last;	/* last mbuf in rx_m's chain */
++
++	u_int16_t	debug;		/* debug level, NG_H4_*_LEVEL */
++	ng_h4_node_stat_ep stat;	/* statistics, see ng_h4.h */
++};
++typedef struct ngh4_softc *sc_p;
++
++#define	NGH4LOCK(sc)		IF_LOCK(&(sc)->outq)
++#define	NGH4UNLOCK(sc)		IF_UNLOCK(&(sc)->outq)
++
++#define	NGH4_STAT_PCKTS_RECV(sc)	((sc)->stat.pckts_recv++)
++#define	NGH4_STAT_BYTES_RECV(sc, n)	((sc)->stat.bytes_recv += (n))
++#define	NGH4_STAT_PCKTS_SENT(sc)	((sc)->stat.pckts_sent++)
++#define	NGH4_STAT_BYTES_SENT(sc, n)	((sc)->stat.bytes_sent += (n))
++#define	NGH4_STAT_IERROR(sc)		((sc)->stat.ierrors++)
++#define	NGH4_STAT_OERROR(sc)		((sc)->stat.oerrors++)
++#define	NGH4_STAT_RESET(sc)		bzero(&(sc)->stat, sizeof((sc)->stat))
++
++/*
++ * Debug printf, gated on sc->debug like ubt(4)'s UBT_DEBUG().
++ * NG_NODE_NAME() never returns NULL (it is "" for an unnamed node), so
++ * there is no NULL case to guard against here.
++ */
++#define	NGH4_DEBUG(level, sc, fmt, ...)				\
++do {									\
++	if ((sc)->debug >= (level))					\
++		log(LOG_DEBUG, "ng_h4: %s: " fmt,			\
++		    (sc)->node != NULL ? NG_NODE_NAME((sc)->node) : "-", \
++		    ## __VA_ARGS__);					\
++} while (0)
++
++#define	NGH4_ALERT(...)		NGH4_DEBUG(NG_H4_ALERT_LEVEL, __VA_ARGS__)
++#define	NGH4_ERR(...)		NGH4_DEBUG(NG_H4_ERR_LEVEL, __VA_ARGS__)
++#define	NGH4_WARN(...)		NGH4_DEBUG(NG_H4_WARN_LEVEL, __VA_ARGS__)
++#define	NGH4_INFO(...)		NGH4_DEBUG(NG_H4_INFO_LEVEL, __VA_ARGS__)
++
++#endif /* ndef _NG_H4_VAR_H_ */
+diff --git a/sys/netgraph/bluetooth/include/ng_h4.h b/sys/netgraph/bluetooth/include/ng_h4.h
+new file mode 100644
+index 000000000..f82a19b0f
+--- /dev/null
++++ b/sys/netgraph/bluetooth/include/ng_h4.h
+@@ -0,0 +1,100 @@
++/*
++ * ng_h4.h
++ */
++
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Andrey Bodrov <ap.bodrov@gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * ng_h4(4) is a Netgraph node that turns an open tty (attached via the
++ * modern ttyhook_register(9) API, the same mechanism ng_tty(4) uses) into
++ * a Bluetooth H4 UART transport.  It reassembles the H4 byte stream into
++ * HCI command/event/ACL/SCO frames on receive, and prepends nothing extra
++ * on transmit -- frames arriving on its single hook are expected to
++ * already carry the H4 packet indicator byte as mtod(m, uint8_t *)[0],
++ * exactly the form ng_hci(4) already builds them in before handing them
++ * to a driver's "drv"-side peer hook (see ng_hci_ulpi.c).
++ *
++ * Nothing here is controller-specific: power sequencing, firmware download
++ * and baud rate changes are the job of whoever opens the tty (for Broadcom
++ * UART controllers, bcmbt(4) and bcmbtattach(8)).
++ */
++
++#ifndef _NETGRAPH_NG_H4_H_
++#define _NETGRAPH_NG_H4_H_
++
++/* Node type name and type cookie */
++#define NG_H4_NODE_TYPE		"h4"
++#define NGM_H4_COOKIE		1474837201
++
++/* The node has exactly one hook, connected to ng_hci(4)'s "drv" hook */
++#define NG_H4_HOOK		"hook"
++
++/* Debug levels, same scale as NG_UBT_*_LEVEL */
++#define NG_H4_ALERT_LEVEL	1
++#define NG_H4_ERR_LEVEL		2
++#define NG_H4_WARN_LEVEL	3
++#define NG_H4_INFO_LEVEL	4
++
++/**************************************************************************
++ **************************************************************************
++ **                    H4 node command/event parameters
++ **************************************************************************
++ **************************************************************************/
++
++/*
++ * Bind the node to an already-open tty file descriptor belonging to
++ * process "pid".  Modeled directly on ng_tty(4)'s NGM_TTY_SET_TTY -- the
++ * caller (e.g. a small setup program, or hcsecd/bluetooth-config once
++ * taught about this node) opens the UART device, then sends this message
++ * naming its own pid and that fd.  May only be done once per node; the
++ * node has no way to probe/open the tty itself.
++ */
++#define NGM_H4_NODE_SET_TTY	1
++typedef struct {
++	int32_t		pid;
++	int32_t		fd;
++} ng_h4_node_set_tty_ep;
++
++#define NGM_H4_NODE_SET_DEBUG	2	/* set debug level */
++#define NGM_H4_NODE_GET_DEBUG	3	/* get debug level */
++typedef u_int16_t		ng_h4_node_debug_ep;
++
++#define NGM_H4_NODE_GET_STAT	4	/* get statistic */
++typedef struct {
++	u_int32_t	pckts_recv;	/* # of HCI frames from tty */
++	u_int32_t	bytes_recv;	/* # of bytes received from tty */
++	u_int32_t	pckts_sent;	/* # of HCI frames sent to tty */
++	u_int32_t	bytes_sent;	/* # of bytes sent to tty */
++	u_int32_t	ierrors;	/* framing / RX allocation errors */
++	u_int32_t	oerrors;	/* dropped/rejected outgoing frames */
++} ng_h4_node_stat_ep;
++
++#define NGM_H4_NODE_RESET_STAT	5	/* reset statistic */
++
++#endif /* ndef _NETGRAPH_NG_H4_H_ */
+-- 
+2.55.0
+

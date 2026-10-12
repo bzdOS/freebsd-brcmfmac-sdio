@@ -1,0 +1,7 @@
+# UART Bluetooth for the AP6212 (BCM43438A1 on uart1). Apply in order
+# (git am / git apply). Verified 2026-10-12 to apply cleanly, in order, to
+# FreeBSD releng/15.1 (15.1-RELEASE-p1, 0f691888d) and to main (a5b1b2d,
+# 2026-10-04). See docs/bluetooth.md.
+0001-netgraph-bluetooth-ng_h4-a-UART-H4-HCI-transport.patch
+0002-aw_rtc-register-the-32-kHz-fanout-gate-clock-id-1.patch
+0003-bcmbt-power-and-clocks-for-UART-attached-Broadcom-Bl.patch

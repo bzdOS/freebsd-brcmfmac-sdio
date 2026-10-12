@@ -1,0 +1,439 @@
+From 9cfd26e354ca19253db9a2057dca0d1050ce7bc7 Mon Sep 17 00:00:00 2001
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Date: Sat, 26 Sep 2026 21:01:08 +0300
+Subject: [PATCH 3/3] bcmbt: power and clocks for UART-attached Broadcom
+ Bluetooth
+
+The DT describes these controllers (brcm,bcm43438-bt and relatives) as a
+child of their UART node with an lpo clock, vbat/vddio supplies and
+shutdown/device-wakeup GPIOs. The UART driver enumerates no children, so
+nothing powered them. bcmbt finds such nodes from simplebus, enables what
+they reference and exposes dev.bcmbt.N.power (0/1/2 = off/on/cycle) and
+dev.bcmbt.N.tty (the parent UART's callout device). Patchram and the hand-off
+to ng_h4 are userland's, like iwmbtfw for USB.
+
+Tested on a Banana Pi M64 (AP6212): enables the aw_rtc 32 kHz fanout and the
+module supplies, the chip then boots its patchram and l2ping reaches a laptop.
+
+Signed-off-by: Andrey Bodrov <ap.bodrov@gmail.com>
+---
+ share/man/man4/Makefile    |   1 +
+ share/man/man4/bcmbt.4     |  58 ++++++++
+ sys/dev/bcmbt/bcmbt.c      | 292 +++++++++++++++++++++++++++++++++++++
+ sys/modules/Makefile       |   2 +
+ sys/modules/bcmbt/Makefile |   7 +
+ 5 files changed, 360 insertions(+)
+ create mode 100644 share/man/man4/bcmbt.4
+ create mode 100644 sys/dev/bcmbt/bcmbt.c
+ create mode 100644 sys/modules/bcmbt/Makefile
+
+diff --git a/share/man/man4/Makefile b/share/man/man4/Makefile
+index 24f2558c3..a3e82af05 100644
+--- a/share/man/man4/Makefile
++++ b/share/man/man4/Makefile
+@@ -80,6 +80,7 @@ MAN=	aac.4 \
+ 	axp.4 \
+ 	bce.4 \
+ 	bcm5974.4 \
++	bcmbt.4 \
+ 	bcma.4 \
+ 	bfe.4 \
+ 	bge.4 \
+diff --git a/share/man/man4/bcmbt.4 b/share/man/man4/bcmbt.4
+new file mode 100644
+index 000000000..653bb4d1b
+--- /dev/null
++++ b/share/man/man4/bcmbt.4
+@@ -0,0 +1,58 @@
++.\"
++.\" SPDX-License-Identifier: BSD-2-Clause
++.\"
++.\" Copyright (c) 2026 Andrey Bodrov <ap.bodrov@gmail.com>
++.\"
++.Dd September 26, 2026
++.Dt BCMBT 4
++.Os
++.Sh NAME
++.Nm bcmbt
++.Nd power control for UART-attached Broadcom Bluetooth controllers
++.Sh SYNOPSIS
++To load the driver as a module at boot time, place the following line in
++.Xr loader.conf 5 :
++.Bd -literal -offset indent
++bcmbt_load="YES"
++.Ed
++.Sh DESCRIPTION
++The
++.Nm
++driver handles the devicetree nodes that describe a Broadcom Bluetooth
++controller attached to a UART
++.Po
++.Qq brcm,bcm43438-bt
++and related compatibles, as children of the UART node
++.Pc .
++On attach it enables the resources such a node references: the
++.Qq lpo
++clock, the
++.Qq vbat-supply
++and
++.Qq vddio-supply
++regulators, and the
++.Qq shutdown-gpios
++and
++.Qq device-wakeup-gpios
++lines, and then powers the controller on.
++.Pp
++Loading the controller's firmware and attaching it to the Bluetooth stack
++is done from userland by
++.Xr bcmbtattach 8 ,
++through
++.Xr ng_h4 4 .
++.Sh SYSCTL VARIABLES
++.Bl -tag -width indent
++.It Va dev.bcmbt.%d.power
++Writing 0 powers the controller off, 1 on, and 2 power-cycles it.
++Reads return 0 or 1.
++.It Va dev.bcmbt.%d.tty
++The callout device of the UART the controller is attached to, for example
++.Pa cuau1 .
++.El
++.Sh SEE ALSO
++.Xr ng_h4 4 ,
++.Xr ng_hci 4 ,
++.Xr bcmbtattach 8
++.Sh AUTHORS
++.An Andrey Bodrov Aq Mt ap.bodrov@gmail.com
+diff --git a/sys/dev/bcmbt/bcmbt.c b/sys/dev/bcmbt/bcmbt.c
+new file mode 100644
+index 000000000..3645a1fde
+--- /dev/null
++++ b/sys/dev/bcmbt/bcmbt.c
+@@ -0,0 +1,292 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Andrey Bodrov
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * bcmbt -- power and clocks for a UART-attached Broadcom Bluetooth controller.
++ *
++ * The devicetree describes these as a child of their UART node
++ * ("brcm,bcm43438-bt" and relatives, Documentation of the Linux binding
++ * brcm,bluetooth.yaml): an `lpo` clock, vbat/vddio supplies, a shutdown
++ * (BT_REG_ON) GPIO and device/host wake GPIOs. FreeBSD's UART driver does
++ * not enumerate children, so nothing brought the chip up. This driver finds
++ * such nodes, enables what they reference, and exposes:
++ *
++ *   dev.bcmbt.N.power   0 = off, 1 = on, 2 = power-cycle (reads 0/1)
++ *   dev.bcmbt.N.tty     the callout device of the parent UART ("cuau1")
++ *
++ * The HCI side -- patchram download and handing the tty to ng_h4(4) -- is
++ * userland's (bcmbtattach), the same split as iwmbtfw(8) for USB.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/module.h>
++#include <sys/sysctl.h>
++
++#include <dev/fdt/simplebus.h>
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++#include <dev/ofw/openfirm.h>
++
++#include <dev/clk/clk.h>
++#include <sys/gpio.h>
++#include <dev/gpio/gpiobusvar.h>
++#include <dev/regulator/regulator.h>
++
++static struct ofw_compat_data compat_data[] = {
++	{ "brcm,bcm43438-bt",	1 },
++	{ "brcm,bcm4329-bt",	1 },
++	{ "brcm,bcm4330-bt",	1 },
++	{ "brcm,bcm4334-bt",	1 },
++	{ "brcm,bcm4345c5",	1 },
++	{ "brcm,bcm43430a0-bt",	1 },
++	{ "brcm,bcm43430a1-bt",	1 },
++	{ "brcm,bcm4335a0",	1 },
++	{ "brcm,bcm4349-bt",	1 },
++	{ "brcm,bcm43540-bt",	1 },
++	{ NULL,			0 }
++};
++
++struct bcmbt_softc {
++	device_t	dev;
++	clk_t		lpo;
++	regulator_t	vbat;
++	regulator_t	vddio;
++	gpio_pin_t	shutdown;
++	gpio_pin_t	wake;
++	int		power;
++	char		tty[16];
++};
++
++static void
++bcmbt_set_power(struct bcmbt_softc *sc, int on)
++{
++
++	if (sc->wake != NULL)
++		gpio_pin_set_active(sc->wake, on);
++	if (sc->shutdown != NULL) {
++		gpio_pin_set_active(sc->shutdown, on);
++		if (on)
++			DELAY(100000);	/* supplies + ROM boot */
++	}
++	sc->power = on;
++}
++
++static int
++bcmbt_power_sysctl(SYSCTL_HANDLER_ARGS)
++{
++	struct bcmbt_softc *sc = arg1;
++	int val, error;
++
++	val = sc->power;
++	error = sysctl_handle_int(oidp, &val, 0, req);
++	if (error != 0 || req->newptr == NULL)
++		return (error);
++	switch (val) {
++	case 0:
++	case 1:
++		bcmbt_set_power(sc, val);
++		return (0);
++	case 2:
++		bcmbt_set_power(sc, 0);
++		DELAY(50000);
++		bcmbt_set_power(sc, 1);
++		return (0);
++	default:
++		return (EINVAL);
++	}
++}
++
++/* The callout device of the UART whose node is our parent. */
++static void
++bcmbt_find_tty(struct bcmbt_softc *sc, phandle_t node)
++{
++	devclass_t dc;
++	phandle_t parent = OF_parent(node);
++	int i;
++
++	strlcpy(sc->tty, "", sizeof(sc->tty));
++	dc = devclass_find("uart");
++	if (dc == NULL)
++		return;
++	for (i = 0; i < devclass_get_maxunit(dc); i++) {
++		device_t u = devclass_get_device(dc, i);
++
++		if (u != NULL && ofw_bus_get_node(u) == parent) {
++			snprintf(sc->tty, sizeof(sc->tty), "cuau%d", i);
++			return;
++		}
++	}
++}
++
++static bool
++bcmbt_node_matches(phandle_t node)
++{
++	const struct ofw_compat_data *cd;
++
++	for (cd = compat_data; cd->ocd_str != NULL; cd++)
++		if (ofw_bus_node_is_compatible(node, cd->ocd_str))
++			return (true);
++	return (false);
++}
++
++/*
++ * The controller's node sits under a UART node, which no bus walks. Add it
++ * as a child of the simplebus above that UART.
++ */
++static void
++bcmbt_identify(driver_t *driver, device_t parent)
++{
++	phandle_t bus, uart, child;
++
++	bus = ofw_bus_get_node(parent);
++	if (bus <= 0)
++		return;
++	for (uart = OF_child(bus); uart != 0; uart = OF_peer(uart)) {
++		for (child = OF_child(uart); child != 0;
++		    child = OF_peer(child)) {
++			if (!bcmbt_node_matches(child))
++				continue;
++			if (!ofw_bus_node_status_okay(child))
++				continue;
++			if (ofw_bus_find_child_device_by_phandle(parent,
++			    child) != NULL)
++				continue;
++			simplebus_add_device(parent, child, 0, NULL, -1, NULL);
++		}
++	}
++}
++
++static int
++bcmbt_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++	device_set_desc(dev, "Broadcom UART Bluetooth power control");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++bcmbt_attach(device_t dev)
++{
++	struct bcmbt_softc *sc = device_get_softc(dev);
++	phandle_t node = ofw_bus_get_node(dev);
++	struct sysctl_ctx_list *ctx;
++	struct sysctl_oid *tree;
++	int error;
++
++	sc->dev = dev;
++
++	if (clk_get_by_ofw_name(dev, node, "lpo", &sc->lpo) == 0) {
++		error = clk_enable(sc->lpo);
++		if (error != 0) {
++			device_printf(dev, "cannot enable lpo clock: %d\n",
++			    error);
++			return (error);
++		}
++	}
++	if (regulator_get_by_ofw_property(dev, node, "vbat-supply",
++	    &sc->vbat) == 0 &&
++	    regulator_enable(sc->vbat) != 0)
++		device_printf(dev, "cannot enable vbat supply\n");
++	if (regulator_get_by_ofw_property(dev, node, "vddio-supply",
++	    &sc->vddio) == 0 &&
++	    regulator_enable(sc->vddio) != 0)
++		device_printf(dev, "cannot enable vddio supply\n");
++
++	if (gpio_pin_get_by_ofw_property(dev, node, "shutdown-gpios",
++	    &sc->shutdown) == 0)
++		gpio_pin_setflags(sc->shutdown, GPIO_PIN_OUTPUT);
++	if (gpio_pin_get_by_ofw_property(dev, node, "device-wakeup-gpios",
++	    &sc->wake) == 0)
++		gpio_pin_setflags(sc->wake, GPIO_PIN_OUTPUT);
++
++	bcmbt_find_tty(sc, node);
++	bcmbt_set_power(sc, 1);
++
++	ctx = device_get_sysctl_ctx(dev);
++	tree = device_get_sysctl_tree(dev);
++	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "power",
++	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
++	    bcmbt_power_sysctl,
++	    "I", "0 = off, 1 = on, 2 = power-cycle");
++	SYSCTL_ADD_STRING(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "tty",
++	    CTLFLAG_RD, sc->tty, 0, "callout device of the parent UART");
++
++	device_printf(dev, "powered%s%s, lpo %s\n",
++	    sc->tty[0] ? " on /dev/" : "",
++	    sc->tty, sc->lpo != NULL ? "on" : "not described");
++	return (0);
++}
++
++static int
++bcmbt_detach(device_t dev)
++{
++	struct bcmbt_softc *sc = device_get_softc(dev);
++
++	bcmbt_set_power(sc, 0);
++	if (sc->wake != NULL)
++		gpio_pin_release(sc->wake);
++	if (sc->shutdown != NULL)
++		gpio_pin_release(sc->shutdown);
++	if (sc->vddio != NULL) {
++		regulator_disable(sc->vddio);
++		regulator_release(sc->vddio);
++	}
++	if (sc->vbat != NULL) {
++		regulator_disable(sc->vbat);
++		regulator_release(sc->vbat);
++	}
++	if (sc->lpo != NULL) {
++		clk_disable(sc->lpo);
++		clk_release(sc->lpo);
++	}
++	return (0);
++}
++
++static device_method_t bcmbt_methods[] = {
++	DEVMETHOD(device_identify,	bcmbt_identify),
++	DEVMETHOD(device_probe,		bcmbt_probe),
++	DEVMETHOD(device_attach,	bcmbt_attach),
++	DEVMETHOD(device_detach,	bcmbt_detach),
++	DEVMETHOD_END
++};
++
++static driver_t bcmbt_driver = {
++	"bcmbt",
++	bcmbt_methods,
++	sizeof(struct bcmbt_softc),
++};
++
++DRIVER_MODULE(bcmbt, simplebus, bcmbt_driver, NULL, NULL);
++MODULE_VERSION(bcmbt, 1);
++SIMPLEBUS_PNP_INFO(compat_data);
+diff --git a/sys/modules/Makefile b/sys/modules/Makefile
+index abb2668f4..c3f3a3ea1 100644
+--- a/sys/modules/Makefile
++++ b/sys/modules/Makefile
+@@ -59,6 +59,7 @@ SUBDIR=	\
+ 	axgbe \
+ 	backlight \
+ 	${_bce} \
++	${_bcmbt} \
+ 	${_bcm283x_clkman} \
+ 	${_bcm283x_pwm} \
+ 	bfe \
+@@ -688,6 +689,7 @@ _irdma=		irdma
+ 	${MACHINE_CPUARCH} == "riscv"
+ .if !empty(OPT_FDT)
+ _allwinner=	allwinner
++_bcmbt=		bcmbt
+ _if_cgem=	if_cgem
+ _sdhci_fdt=	sdhci_fdt
+ .endif
+diff --git a/sys/modules/bcmbt/Makefile b/sys/modules/bcmbt/Makefile
+new file mode 100644
+index 000000000..cddc6397a
+--- /dev/null
++++ b/sys/modules/bcmbt/Makefile
+@@ -0,0 +1,7 @@
++.PATH: ${SRCTOP}/sys/dev/bcmbt
++
++KMOD=	bcmbt
++SRCS=	bcmbt.c
++SRCS+=	bus_if.h clknode_if.h device_if.h gpio_if.h ofw_bus_if.h regdev_if.h regnode_if.h opt_platform.h
++
++.include <bsd.kmod.mk>
+-- 
+2.55.0
+
