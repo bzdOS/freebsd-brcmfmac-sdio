@@ -1,0 +1,380 @@
+From 84c26a93a13d2175e4f78933dccbb512dc2278f8 Mon Sep 17 00:00:00 2001
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Date: Sun, 11 Oct 2026 23:20:36 +0300
+Subject: [PATCH 4/5] bwfm: hostap mode with the firmware authenticator;
+ ifconfig wpakey applies at once
+
+A hostap vap (ifconfig wlanN create wlandev bwfm0 wlanmode hostap)
+starts a firmware BSS when net80211 reaches RUN: AP mode and channel
+while down, auth/wsec/wpa_auth, up, the PSK via WLC_SET_WSEC_PMK, then
+SET_SSID.  With a PSK it is WPA2-PSK with CCMP only; the firmware runs
+the 4-way and group handshakes.  Station association/departure events
+are logged.  Firmware promiscuous mode stays off as an AP (bridge
+members are set promiscuous; the AP hands up every client frame).
+
+ifconfig: wpakey is applied immediately when the SSID is already known,
+salted with the SSID given on the same command line, so an access point
+does not come up open between "up" and the end of the arguments.
+---
+ sbin/ifconfig/ifieee80211.c |  37 ++++++-
+ sys/dev/bwfm/bwfm.c         | 205 +++++++++++++++++++++++++++++++++++-
+ sys/dev/bwfm/bwfmvar.h      |   1 +
+ 3 files changed, 237 insertions(+), 6 deletions(-)
+
+diff --git a/sbin/ifconfig/ifieee80211.c b/sbin/ifconfig/ifieee80211.c
+index 6586fddf8..5ffd33114 100644
+--- a/sbin/ifconfig/ifieee80211.c
++++ b/sbin/ifconfig/ifieee80211.c
+@@ -606,6 +606,9 @@ isanyarg(const char *arg)
+ 	    strncasecmp(arg, "any", 3) == 0 || strncasecmp(arg, "off", 3) == 0);
+ }
+ 
++static uint8_t wpakey_ssid[IEEE80211_NWID_LEN];
++static int wpakey_ssidlen = -1;
++
+ static void
+ set80211ssid(if_ctx *ctx, const char *val, int dummy __unused)
+ {
+@@ -626,6 +629,9 @@ set80211ssid(if_ctx *ctx, const char *val, int dummy __unused)
+ 		exit(1);
+ 
+ 	set80211(ctx, IEEE80211_IOC_SSID, ssid, len, data);
++	/* wpakey salts the PSK with the SSID given on this command line. */
++	memcpy(wpakey_ssid, data, len);
++	wpakey_ssidlen = len;
+ }
+ 
+ static void
+@@ -1087,7 +1093,11 @@ wpakey_cb(if_ctx *ctx, void *arg __unused)
+ 		    0, NULL);
+ 		return;
+ 	}
+-	if (!wpakey_hex(wpakey_arg, psk)) {
++	if (wpakey_hex(wpakey_arg, psk)) {
++		/* the PSK itself */
++	} else if (wpakey_ssidlen > 0) {
++		wpakey_pbkdf2(wpakey_arg, wpakey_ssid, wpakey_ssidlen, psk);
++	} else {
+ 		if (get80211len(ctx, IEEE80211_IOC_SSID, ssid, sizeof(ssid),
+ 		    &ssidlen) < 0 || ssidlen == 0)
+ 			errx(1, "wpakey: set the ssid first (it salts the key)");
+@@ -1105,8 +1115,20 @@ wpakey_cb(if_ctx *ctx, void *arg __unused)
+ 	explicit_bzero(psk, sizeof(psk));
+ }
+ 
++static bool
++has_ssid(if_ctx *ctx)
++{
++	uint8_t ssid[IEEE80211_NWID_LEN];
++	int len;
++
++	if (wpakey_ssidlen >= 0)
++		return (wpakey_ssidlen > 0);
++	return (get80211len(ctx, IEEE80211_IOC_SSID, ssid, sizeof(ssid),
++	    &len) >= 0 && len > 0);
++}
++
+ static void
+-set80211wpakey(if_ctx *ctx __unused, const char *val, int dummy __unused)
++set80211wpakey(if_ctx *ctx, const char *val, int dummy __unused)
+ {
+ 	uint8_t psk[32];
+ 	size_t len;
+@@ -1117,6 +1139,17 @@ set80211wpakey(if_ctx *ctx __unused, const char *val, int dummy __unused)
+ 		    "or 64 hex digits");
+ 	explicit_bzero(psk, sizeof(psk));
+ 	strlcpy(wpakey_arg, val, sizeof(wpakey_arg));
++	/*
++	 * Apply now if the SSID is already known (the usual
++	 * "ssid X wpakey Y ... up"): an access point must not come up open
++	 * for the moment between "up" and the end of the argument list.
++	 * Otherwise wait for the SSID that may still follow.
++	 */
++	if (wpakey_hex(val, psk) || has_ssid(ctx)) {
++		explicit_bzero(psk, sizeof(psk));
++		wpakey_cb(ctx, NULL);
++		return;
++	}
+ 	if (!wpakey_registered) {
+ 		callback_register(wpakey_cb, NULL);
+ 		wpakey_registered = true;
+diff --git a/sys/dev/bwfm/bwfm.c b/sys/dev/bwfm/bwfm.c
+index 2363c4865..29a4f8b36 100644
+--- a/sys/dev/bwfm/bwfm.c
++++ b/sys/dev/bwfm/bwfm.c
+@@ -1323,6 +1323,7 @@ bwfm_ic_attach(struct bwfm_softc *sc)
+ 	ic->ic_opmode = IEEE80211_M_STA;
+ 	ic->ic_caps =
+ 	    IEEE80211_C_STA |
++	    IEEE80211_C_HOSTAP |	/* firmware access point */
+ 	    IEEE80211_C_WPA |		/* WPA/RSN */
+ 	    IEEE80211_C_SHPREAMBLE |
+ 	    IEEE80211_C_SHSLOT;
+@@ -1498,7 +1499,7 @@ bwfm_iff(struct bwfm_softc *sc)
+ 	bwfm_fwvar_var_set_data(sc, "mcast_list", &mcast, sizeof(mcast));
+ 	bwfm_fwvar_var_set_int(sc, "allmulti", 1);
+ 	bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_PROMISC,
+-	    ic->ic_promisc > 0);
++	    ic->ic_opmode != IEEE80211_M_HOSTAP && ic->ic_promisc > 0);
+ }
+ 
+ static int
+@@ -1547,6 +1548,10 @@ bwfm_fw_init(struct bwfm_softc *sc, enum ieee80211_opmode opmode)
+ 		BWFM_EVENT(BWFM_E_ESCAN_RESULT);
+ 		break;
+ 	case IEEE80211_M_HOSTAP:
++		BWFM_EVENT(BWFM_E_IF);
++		BWFM_EVENT(BWFM_E_LINK);
++		BWFM_EVENT(BWFM_E_SET_SSID);
++		BWFM_EVENT(BWFM_E_PSK_SUP);
+ 		BWFM_EVENT(BWFM_E_AUTH_IND);
+ 		BWFM_EVENT(BWFM_E_ASSOC_IND);
+ 		BWFM_EVENT(BWFM_E_REASSOC_IND);
+@@ -2251,6 +2256,135 @@ bwfm_join_timeout(void *arg)
+ 	IEEE80211_UNLOCK(ic);
+ }
+ 
++/*
++ * Access point: the firmware beacons, answers probes, authenticates and
++ * associates stations and, with a PSK, runs the WPA2 authenticator
++ * (4-way and group handshake, CCMP).  Configuration follows the order the
++ * firmware wants: AP mode and channel while down, security, up, PSK, then
++ * SET_SSID starts the BSS.
++ */
++static int bwfm_ap_pmk_fmt = 0;
++SYSCTL_INT(_hw_bwfm, OID_AUTO, ap_pmk_fmt, CTLFLAG_RWTUN, &bwfm_ap_pmk_fmt,
++    0, "AP PSK format for the firmware: 0 = 32 raw bytes, 1 = 64 hex digits");
++
++static int
++bwfm_hostap_start(struct bwfm_softc *sc, struct ieee80211vap *vap)
++{
++	struct ieee80211com *ic = vap->iv_ic;
++	struct bwfm_join_params join;
++	struct bwfm_wsec_pmk_v2 pmk;
++	struct ieee80211_channel *c;
++	uint8_t essid[IEEE80211_NWID_LEN];
++	uint32_t chanspec, wpa, wsec;
++	int esslen, error, i;
++	bool psk;
++	static const char hx[] = "0123456789abcdef";
++
++	esslen = MIN(vap->iv_des_ssid[0].len, BWFM_MAX_SSID_LEN);
++	memcpy(essid, vap->iv_des_ssid[0].ssid, esslen);
++	if (esslen == 0) {
++		esslen = MIN(vap->iv_bss->ni_esslen, BWFM_MAX_SSID_LEN);
++		memcpy(essid, vap->iv_bss->ni_essid, esslen);
++	}
++	c = (vap->iv_bss->ni_chan != IEEE80211_CHAN_ANYC) ?
++	    vap->iv_bss->ni_chan : ic->ic_curchan;
++	chanspec = bwfm_chan2spec(sc, c);
++	psk = (vap->iv_flags & IEEE80211_F_WPA) && vap->iv_wpapsk_len != 0;
++	if (esslen == 0) {
++		printf("%s: no SSID set\n", if_name(vap->iv_ifp));
++		return EINVAL;
++	}
++	if ((vap->iv_flags & IEEE80211_F_WPA) && !psk) {
++		printf("%s: WPA needs a key (ifconfig wpakey)\n",
++		    if_name(vap->iv_ifp));
++		return EINVAL;
++	}
++
++	bwfm_fwvar_cmd_set_int(sc, BWFM_C_DOWN, 1);
++	bwfm_fwvar_var_set_int(sc, "apsta", 0);
++	bwfm_fwvar_var_set_int(sc, "mpc", 0);
++	bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_INFRA, 1);
++	if (bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_AP, 1)) {
++		printf("%s: firmware refused AP mode\n", DEVNAME(sc));
++		return EIO;
++	}
++	bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_PM, BWFM_PM_CAM);
++	if (bwfm_fwvar_var_set_int(sc, "chanspec", chanspec))
++		printf("%s: chanspec %#x refused\n", DEVNAME(sc), chanspec);
++
++	if (psk) {
++		/* WPA2 (RSN) with CCMP only. */
++		wpa = BWFM_WPA_AUTH_WPA2_PSK;
++		wsec = BWFM_WSEC_AES;
++		bwfm_fwvar_var_set_int(sc, "wme_bss_disable", 0);
++	} else {
++		wpa = BWFM_WPA_AUTH_DISABLED;
++		wsec = BWFM_WSEC_NONE;
++	}
++	bwfm_fwvar_var_set_int(sc, "auth", BWFM_AUTH_OPEN);
++	bwfm_fwvar_var_set_int(sc, "wsec", wsec);
++	bwfm_fwvar_var_set_int(sc, "wpa_auth", wpa);
++	bwfm_fwvar_var_set_int(sc, "mfp", BWFM_MFP_NONE);
++
++	if (bwfm_fwvar_cmd_set_int(sc, BWFM_C_UP, 1)) {
++		printf("%s: firmware UP failed\n", DEVNAME(sc));
++		return EIO;
++	}
++
++	if (psk) {
++		memset(&pmk, 0, sizeof(pmk));
++		if (bwfm_ap_pmk_fmt == 1) {
++			for (i = 0; i < 32; i++) {
++				pmk.key[2 * i] = hx[vap->iv_wpapsk[i] >> 4];
++				pmk.key[2 * i + 1] = hx[vap->iv_wpapsk[i] & 0xf];
++			}
++			pmk.key_len = htole16(64);
++		} else {
++			memcpy(pmk.key, vap->iv_wpapsk, 32);
++			pmk.key_len = htole16(32);
++		}
++		error = bwfm_fwvar_cmd_set_data(sc, BWFM_C_SET_WSEC_PMK,
++		    &pmk, sizeof(pmk));
++		explicit_bzero(&pmk, sizeof(pmk));
++		if (error) {
++			printf("%s: firmware rejected the AP PSK (%d)\n",
++			    DEVNAME(sc), error);
++			return EIO;
++		}
++	}
++
++	memset(&join, 0, sizeof(join));
++	memcpy(join.ssid.ssid, essid, esslen);
++	join.ssid.len = htole32(esslen);
++	memset(join.assoc.bssid, 0xff, sizeof(join.assoc.bssid));
++	error = bwfm_fwvar_cmd_set_data(sc, BWFM_C_SET_SSID, &join,
++	    sizeof(join));
++	if (error) {
++		printf("%s: could not start the BSS (%d)\n", DEVNAME(sc),
++		    error);
++		return EIO;
++	}
++	bwfm_fwvar_var_set_int(sc, "closednet",
++	    (vap->iv_flags & IEEE80211_F_HIDESSID) != 0);
++
++	printf("%s: access point '%.*s' on channel %u, %s\n",
++	    if_name(vap->iv_ifp), esslen, essid,
++	    ieee80211_chan2ieee(ic, c), psk ? "WPA2-PSK (CCMP)" : "open");
++	return 0;
++}
++
++static void
++bwfm_hostap_stop(struct bwfm_softc *sc)
++{
++	struct bwfm_join_params join;
++
++	memset(&join, 0, sizeof(join));
++	bwfm_fwvar_cmd_set_data(sc, BWFM_C_SET_SSID, &join, sizeof(join));
++	bwfm_fwvar_cmd_set_int(sc, BWFM_C_DOWN, 1);
++	bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_AP, 0);
++	bwfm_fwvar_cmd_set_int(sc, BWFM_C_UP, 1);
++}
++
+ static int
+ bwfm_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ {
+@@ -2266,6 +2400,22 @@ bwfm_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 	    bvap->bv_join));
+ 
+ 	callout_stop(&bvap->bv_join_to);
++	if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
++		if (nstate == IEEE80211_S_RUN && !bvap->bv_ap_up &&
++		    sc->sc_running) {
++			IEEE80211_UNLOCK(ic);
++			error = bwfm_hostap_start(sc, vap);
++			IEEE80211_LOCK(ic);
++			bvap->bv_ap_up = (error == 0);
++		} else if (nstate < IEEE80211_S_RUN && bvap->bv_ap_up) {
++			IEEE80211_UNLOCK(ic);
++			if (sc->sc_running)
++				bwfm_hostap_stop(sc);
++			IEEE80211_LOCK(ic);
++			bvap->bv_ap_up = false;
++		}
++		return (bvap->bv_newstate(vap, nstate, arg));
++	}
+ 	switch (nstate) {
+ 	case IEEE80211_S_INIT:
+ 	case IEEE80211_S_SCAN:
+@@ -2339,6 +2489,46 @@ bwfm_link_down(struct bwfm_softc *sc, struct ieee80211vap *vap, int arg)
+ 		ieee80211_new_state(vap, IEEE80211_S_SCAN, arg);
+ }
+ 
++/* Station comings and goings, for the log (the firmware keeps the table). */
++static void
++bwfm_hostap_event(struct bwfm_softc *sc, struct ieee80211vap *vap,
++    uint32_t type, uint32_t status, uint32_t reason, uint16_t flags,
++    const uint8_t *addr)
++{
++	const char *ifn = if_name(vap->iv_ifp);
++
++	switch (type) {
++	case BWFM_E_LINK:
++		printf("%s: BSS %s\n", ifn,
++		    (flags & BWFM_EVENT_MSG_LINK) ? "up" : "down");
++		break;
++	case BWFM_E_SET_SSID:
++		if (status != BWFM_E_STATUS_SUCCESS)
++			printf("%s: BSS start failed (status %u)\n", ifn,
++			    status);
++		break;
++	case BWFM_E_AUTH_IND:
++		DPRINTF(("%s: %6D authenticating\n", ifn, addr, ":"));
++		break;
++	case BWFM_E_ASSOC_IND:
++	case BWFM_E_REASSOC_IND:
++		printf("%s: station %6D associated\n", ifn, addr, ":");
++		break;
++	case BWFM_E_DEAUTH_IND:
++	case BWFM_E_DISASSOC_IND:
++		printf("%s: station %6D left (%s, reason %u)\n", ifn, addr,
++		    ":", type == BWFM_E_DEAUTH_IND ? "deauth" : "disassoc",
++		    reason);
++		break;
++	case BWFM_E_PSK_SUP:
++		printf("%s: station %6D handshake status %u reason %u\n",
++		    ifn, addr, ":", status, reason);
++		break;
++	default:
++		break;
++	}
++}
++
+ static void
+ bwfm_rx_event_cb(struct bwfm_softc *sc, struct mbuf *m)
+ {
+@@ -2366,7 +2556,14 @@ bwfm_rx_event_cb(struct bwfm_softc *sc, struct mbuf *m)
+ 	BWFM_LOCK(sc);
+ 	vap = sc->sc_vap;
+ 	BWFM_UNLOCK(sc);
+-	if (vap == NULL || vap->iv_opmode != IEEE80211_M_STA)
++	if (vap == NULL)
++		return;
++	if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
++		bwfm_hostap_event(sc, vap, type, status, reason, flags,
++		    e->msg.addr.octet);
++		return;
++	}
++	if (vap->iv_opmode != IEEE80211_M_STA)
+ 		return;
+ 	bvap = BWFM_VAP(vap);
+ 	if (bvap->bv_join == BWFM_JOIN_IDLE)
+@@ -2549,8 +2746,8 @@ bwfm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
+ 	struct ieee80211vap *vap;
+ 	if_t ifp;
+ 
+-	if (opmode != IEEE80211_M_STA) {
+-		ic_printf(ic, "only station mode is supported so far\n");
++	if (opmode != IEEE80211_M_STA && opmode != IEEE80211_M_HOSTAP) {
++		ic_printf(ic, "only station and hostap mode are supported\n");
+ 		return (NULL);
+ 	}
+ 	if (!TAILQ_EMPTY(&ic->ic_vaps))
+diff --git a/sys/dev/bwfm/bwfmvar.h b/sys/dev/bwfm/bwfmvar.h
+index c58d679da..7f54f4737 100644
+--- a/sys/dev/bwfm/bwfmvar.h
++++ b/sys/dev/bwfm/bwfmvar.h
+@@ -152,6 +152,7 @@ struct bwfm_vap {
+ 	struct callout		 bv_join_to;
+ 	enum bwfm_join		 bv_join;
+ 	bool			 bv_fwsup;	/* firmware 4-way handshake */
++	bool			 bv_ap_up;	/* hostap: BSS started */
+ };
+ #define	BWFM_VAP(_vap)		((struct bwfm_vap *)(_vap))
+ 
+-- 
+2.55.0
+

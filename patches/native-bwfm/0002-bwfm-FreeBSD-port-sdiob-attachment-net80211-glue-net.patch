@@ -1,7 +1,7 @@
 From e1b0e8b640d636d3488787cafc47a5aba6c2a4f5 Mon Sep 17 00:00:00 2001
 From: Andrey Bodrov <ap.bodrov@gmail.com>
 Date: Sun, 11 Oct 2026 22:40:06 +0300
-Subject: [PATCH 2/3] bwfm: FreeBSD port (sdiob attachment, net80211 glue);
+Subject: [PATCH 2/5] bwfm: FreeBSD port (sdiob attachment, net80211 glue);
  net80211/ifconfig: firmware WPA PSK
 
 bwfm(4): native Broadcom FullMAC SDIO driver from OpenBSD's.  Chip,

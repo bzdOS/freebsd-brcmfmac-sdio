@@ -1,0 +1,697 @@
+From fb9eef308d488a2f1a2e7be5b4f3bf140f484096 Mon Sep 17 00:00:00 2001
+From: Andrey Bodrov <ap.bodrov@gmail.com>
+Date: Mon, 12 Oct 2026 15:29:50 +0300
+Subject: [PATCH 5/5] bwfm: never hold up the boot; bounded bring-up of a chip
+ left running by a warm reset
+
+A warm reset does not power-cycle the chip: the old firmware may still be
+running, or the chip may be asleep, and a boot hung for minutes right
+after "chip 43430 rev 1".  Each failed SDIO command costs the sdiob
+timeout (5 s, CMD53 with retries up to 20 s), the driver's register
+loops ran up to thousands of them, and a failed backplane read returned
+0, on which the EROM scan never terminates.
+
+- all chip access (bring-up, firmware download, firmware init) runs in a
+  task; attach waits for it at most hw.bwfm.attach_wait (10 s) and then
+  lets the boot continue; a later completion is announced to devd as
+  WIFI ATTACH (devd.conf runs pccard_ether bwfmN startchildren);
+- bus errors are counted; after 8 in a row the card is declared dead,
+  further accesses fail at once and the device stays idle;
+- failed reads return all ones; clock waits are bounded by time, the
+  EROM scan by entry count;
+- before the backplane is touched: card interrupts off, F2 disabled,
+  KSO written until the chip reports KSO and DEVON (bounded);
+- firmware verification after download compares the first 4 KB by
+  default (hw.bwfm.verify_fw=1: everything), halving the download time
+  on the slow SDIO bus; a verification mismatch is now an error;
+- the bring-up logs its phase times.
+---
+ sbin/devd/devd.conf         |   7 +
+ sys/dev/bwfm/bwfm.c         |   4 +-
+ sys/dev/bwfm/if_bwfm_sdio.c | 381 +++++++++++++++++++++++++++---------
+ 3 files changed, 294 insertions(+), 98 deletions(-)
+
+diff --git a/sbin/devd/devd.conf b/sbin/devd/devd.conf
+index 4ffb8cde4..c8109bd88 100644
+--- a/sbin/devd/devd.conf
++++ b/sbin/devd/devd.conf
+@@ -51,6 +51,13 @@ attach 0 {
+ 	device-name "$wifi-driver-regex";
+ 	action "/etc/pccard_ether $device-name startchildren";
+ };
++# A WiFi driver whose firmware came up after attach returned (bwfm(4)
++# does not hold up the boot for a slow or stuck chip) reports it here.
++notify 0 {
++	match "system"		"WIFI";
++	match "type"		"ATTACH";
++	action "/etc/pccard_ether $subsystem startchildren";
++};
+ detach 0 {
+ 	device-name "$wifi-driver-regex";
+ 	action "/etc/pccard_ether $device-name stopchildren";
+diff --git a/sys/dev/bwfm/bwfm.c b/sys/dev/bwfm/bwfm.c
+index 29a4f8b36..d13a566d1 100644
+--- a/sys/dev/bwfm/bwfm.c
++++ b/sys/dev/bwfm/bwfm.c
+@@ -417,10 +417,12 @@ bwfm_chip_dmp_erom_scan(struct bwfm_softc *sc)
+ 	uint16_t id;
+ 	uint8_t nmw, nsw, rev;
+ 	struct bwfm_core *core;
++	int guard = 0;
+ 
+ 	erom = sc->sc_buscore_ops->bc_read(sc,
+ 	    BWFM_CHIP_BASE + BWFM_CHIP_REG_EROMPTR);
+-	while (type != BWFM_DMP_DESC_EOT) {
++	/* Bounded: a chip that answers garbage must not keep us here. */
++	while (type != BWFM_DMP_DESC_EOT && guard++ < 4096) {
+ 		val = sc->sc_buscore_ops->bc_read(sc, erom);
+ 		type = val & BWFM_DMP_DESC_MASK;
+ 		erom += 4;
+diff --git a/sys/dev/bwfm/if_bwfm_sdio.c b/sys/dev/bwfm/if_bwfm_sdio.c
+index 4ad820cb7..edcf749de 100644
+--- a/sys/dev/bwfm/if_bwfm_sdio.c
++++ b/sys/dev/bwfm/if_bwfm_sdio.c
+@@ -87,6 +87,20 @@ static int bwfm_sdio_poll_ms = 10;
+ SYSCTL_INT(_hw_bwfm, OID_AUTO, sdio_poll_ms, CTLFLAG_RWTUN,
+     &bwfm_sdio_poll_ms, 0, "Card interrupt poll period (ms)");
+ 
++static int bwfm_sdio_attach_wait = 10;
++SYSCTL_INT(_hw_bwfm, OID_AUTO, attach_wait, CTLFLAG_RWTUN,
++    &bwfm_sdio_attach_wait, 0,
++    "Seconds attach waits for the firmware to come up before letting "
++    "boot continue (0: never wait)");
++
++static int bwfm_sdio_verify_fw = 0;
++SYSCTL_INT(_hw_bwfm, OID_AUTO, verify_fw, CTLFLAG_RWTUN,
++    &bwfm_sdio_verify_fw, 0,
++    "Read the whole firmware image back after download");
++
++/* After this many consecutive failed bus operations the card is dead. */
++#define	BWFM_SDIO_MAX_ERR	8
++
+ #define DPRINTF(x)	do { if (bwfm_sdio_debug > 0) printf x; } while (0)
+ #define DPRINTFN(n, x)	do { if (bwfm_sdio_debug >= (n)) printf x; } while (0)
+ 
+@@ -109,6 +123,13 @@ struct bwfm_sdio_softc {
+ 	int			  sc_poll_on;
+ 
+ 	int			  sc_initialized;
++	int			  sc_bus_err;	/* consecutive bus errors */
++	int			  sc_dead;	/* card stopped answering */
++	int			  sc_attach_state; /* BWFM_SDIO_ATT_* */
++#define	BWFM_SDIO_ATT_PENDING	0
++#define	BWFM_SDIO_ATT_DONE	1
++#define	BWFM_SDIO_ATT_FAILED	2
++	int			  sc_attach_waiting; /* device_attach still in */
+ 
+ 	uint32_t		  sc_bar0;
+ 	int			  sc_clkstate;
+@@ -236,15 +257,45 @@ bwfm_sdio_fn(uint32_t addr)
+ 	return ((addr & ~0x7ff) == 0 ? 0 : 1);
+ }
+ 
++/*
++ * Every bus access goes through bwfm_sdio_err().  A card that stopped
++ * answering (each failed command costs the sdiob timeout, seconds) must
++ * not be polled through the driver's register loops for minutes: after
++ * BWFM_SDIO_MAX_ERR failures in a row it is declared dead and further
++ * accesses fail at once.
++ */
++static int
++bwfm_sdio_err(struct bwfm_sdio_softc *sc, int error, const char *what,
++    uint32_t addr)
++{
++
++	if (error == 0) {
++		sc->sc_bus_err = 0;
++		return (0);
++	}
++	DPRINTF(("%s: %s %#x failed: %d\n", DEVNAME(&sc->sc_sc), what, addr,
++	    error));
++	if (++sc->sc_bus_err >= BWFM_SDIO_MAX_ERR && !sc->sc_dead) {
++		sc->sc_dead = 1;
++		device_printf(sc->sc_sc.sc_dev,
++		    "card not responding (%d bus errors in a row), giving up; "
++		    "WiFi stays down until the module is reloaded or the "
++		    "board is power-cycled\n", sc->sc_bus_err);
++	}
++	return (error);
++}
++
+ static uint8_t
+ bwfm_sdio_read_1(struct bwfm_sdio_softc *sc, uint32_t addr)
+ {
+ 	uint8_t rv;
+ 
+-	rv = 0;
+-	if (SDIO_READ_DIRECT(sc->sc_bus, bwfm_sdio_fn(addr), addr, &rv) != 0)
+-		DPRINTF(("%s: CMD52 read %#x failed\n", DEVNAME(&sc->sc_sc),
+-		    addr));
++	if (sc->sc_dead)
++		return (0xff);
++	rv = 0xff;
++	if (bwfm_sdio_err(sc, SDIO_READ_DIRECT(sc->sc_bus, bwfm_sdio_fn(addr),
++	    addr, &rv), "CMD52 read", addr) != 0)
++		return (0xff);
+ 	return rv;
+ }
+ 
+@@ -252,9 +303,10 @@ static void
+ bwfm_sdio_write_1(struct bwfm_sdio_softc *sc, uint32_t addr, uint8_t data)
+ {
+ 
+-	if (SDIO_WRITE_DIRECT(sc->sc_bus, bwfm_sdio_fn(addr), addr, data) != 0)
+-		DPRINTF(("%s: CMD52 write %#x failed\n", DEVNAME(&sc->sc_sc),
+-		    addr));
++	if (sc->sc_dead)
++		return;
++	(void) bwfm_sdio_err(sc, SDIO_WRITE_DIRECT(sc->sc_bus,
++	    bwfm_sdio_fn(addr), addr, data), "CMD52 write", addr);
+ }
+ 
+ static uint32_t
+@@ -263,17 +315,24 @@ bwfm_sdio_read_4(struct bwfm_sdio_softc *sc, uint32_t addr)
+ 	uint32_t bar0 = addr & ~BWFM_SDIO_SB_OFT_ADDR_MASK;
+ 	uint32_t rv __aligned(8);
+ 
++	if (sc->sc_dead)
++		return (0xffffffff);
+ 	bwfm_sdio_backplane(sc, bar0);
+ 
+ 	addr &= BWFM_SDIO_SB_OFT_ADDR_MASK;
+ 	addr |= BWFM_SDIO_SB_ACCESS_2_4B_FLAG;
+ 
+-	/* One 4-byte CMD53; four CMD52s upset the chip's SDIO core. */
++	/*
++	 * One 4-byte CMD53; four CMD52s upset the chip's SDIO core.  A
++	 * failed read returns all ones, which every register loop in the
++	 * chip code treats as "end"/"not ready" (an EROM scan reading zeros
++	 * would walk the backplane forever).
++	 */
+ 	rv = 0;
+-	if (SDIO_READ_EXTENDED(sc->sc_bus, bwfm_sdio_fn(addr), addr,
+-	    sizeof(rv), (uint8_t *)&rv, true) != 0)
+-		DPRINTF(("%s: CMD53 read %#x failed\n", DEVNAME(&sc->sc_sc),
+-		    addr));
++	if (bwfm_sdio_err(sc, SDIO_READ_EXTENDED(sc->sc_bus,
++	    bwfm_sdio_fn(addr), addr, sizeof(rv), (uint8_t *)&rv, true),
++	    "CMD53 read", addr) != 0)
++		return (0xffffffff);
+ 	return le32toh(rv);
+ }
+ 
+@@ -283,16 +342,17 @@ bwfm_sdio_write_4(struct bwfm_sdio_softc *sc, uint32_t addr, uint32_t data)
+ 	uint32_t bar0 = addr & ~BWFM_SDIO_SB_OFT_ADDR_MASK;
+ 	uint32_t v __aligned(8);
+ 
++	if (sc->sc_dead)
++		return;
+ 	bwfm_sdio_backplane(sc, bar0);
+ 
+ 	addr &= BWFM_SDIO_SB_OFT_ADDR_MASK;
+ 	addr |= BWFM_SDIO_SB_ACCESS_2_4B_FLAG;
+ 
+ 	v = htole32(data);
+-	if (SDIO_WRITE_EXTENDED(sc->sc_bus, bwfm_sdio_fn(addr), addr,
+-	    sizeof(v), (uint8_t *)&v, true) != 0)
+-		DPRINTF(("%s: CMD53 write %#x failed\n", DEVNAME(&sc->sc_sc),
+-		    addr));
++	(void) bwfm_sdio_err(sc, SDIO_WRITE_EXTENDED(sc->sc_bus,
++	    bwfm_sdio_fn(addr), addr, sizeof(v), (uint8_t *)&v, true),
++	    "CMD53 write", addr);
+ }
+ 
+ static int
+@@ -304,9 +364,11 @@ bwfm_sdio_buf_read(struct bwfm_sdio_softc *sc, struct sdio_func *sf,
+ 	KASSERT(((vm_offset_t)data & 0x3) == 0, ("unaligned buffer"));
+ 	KASSERT((size & 0x3) == 0, ("unaligned size"));
+ 
++	if (sc->sc_dead)
++		return (EIO);
+ 	/* F1: backplane memory (incrementing); F2: frame FIFO (fixed). */
+-	err = SDIO_READ_EXTENDED(sc->sc_bus, sf->fn, reg, size,
+-	    (uint8_t *)data, sf == sc->sc_f1);
++	err = bwfm_sdio_err(sc, SDIO_READ_EXTENDED(sc->sc_bus, sf->fn, reg,
++	    size, (uint8_t *)data, sf == sc->sc_f1), "CMD53 buf read", reg);
+ 	if (err)
+ 		printf("%s: %s: error %d\n", DEVNAME(&sc->sc_sc), __func__,
+ 		    err);
+@@ -322,8 +384,10 @@ bwfm_sdio_buf_write(struct bwfm_sdio_softc *sc, struct sdio_func *sf,
+ 	KASSERT(((vm_offset_t)data & 0x3) == 0, ("unaligned buffer"));
+ 	KASSERT((size & 0x3) == 0, ("unaligned size"));
+ 
+-	err = SDIO_WRITE_EXTENDED(sc->sc_bus, sf->fn, reg, size,
+-	    (uint8_t *)data, true);
++	if (sc->sc_dead)
++		return (EIO);
++	err = bwfm_sdio_err(sc, SDIO_WRITE_EXTENDED(sc->sc_bus, sf->fn, reg,
++	    size, (uint8_t *)data, true), "CMD53 buf write", reg);
+ 	if (err)
+ 		printf("%s: %s: error %d\n", DEVNAME(&sc->sc_sc), __func__,
+ 		    err);
+@@ -387,57 +451,55 @@ bwfm_sdio_sibling(device_t dev, uint8_t fn)
+ 	return (f);
+ }
+ 
++/*
++ * A warm reboot (or a guest restart) does not power-cycle the chip: the
++ * previous firmware may still be running, with F2 and card interrupts
++ * enabled, or the chip may be asleep (KSO cleared), in which case every
++ * backplane access times out.  Quiet the card and wake it before talking
++ * to the backplane; the ARM core is then halted by bwfm_chip_attach()
++ * (set_passive) before the new firmware is written to RAM.
++ */
+ static void
+-bwfm_sdio_attach_task(void *arg, int pending __unused)
++bwfm_sdio_quiesce(struct bwfm_sdio_softc *sc)
+ {
+-	struct bwfm_sdio_softc *sc = arg;
+-	struct bwfm_softc *bwfm = &sc->sc_sc;
+-	int i;
+-
+-	/* Firmware files live on the root file system. */
+-	for (i = 0; rootvnode == NULL && i < 300; i++)
+-		pause("bwfmroot", hz);
+-	if (bwfm_sdio_preinit(bwfm) != 0 || bwfm_preinit(bwfm) != 0) {
+-		device_printf(bwfm->sc_dev, "firmware start failed\n");
+-		return;
++	sbintime_t deadline;
++	uint8_t v;
++	int tries;
++
++	(void) SDIO_WRITE_DIRECT(sc->sc_bus, 0, BWFM_SDIO_CCCR_INT_ENABLE, 0);
++	(void) sdio_disable_func(sc->sc_f2);
++
++	/* Keep SDIO On: write until the chip reports KSO and DEVON. */
++	deadline = getsbinuptime() + 2 * SBT_1S;
++	for (tries = 0; tries < 64; tries++) {
++		(void) SDIO_WRITE_DIRECT(sc->sc_bus, 1,
++		    BWFM_SDIO_FUNC1_SLEEPCSR, BWFM_SDIO_FUNC1_SLEEPCSR_KSO);
++		DELAY(100);
++		v = 0;
++		if (SDIO_READ_DIRECT(sc->sc_bus, 1, BWFM_SDIO_FUNC1_SLEEPCSR,
++		    &v) == 0 && (v & (BWFM_SDIO_FUNC1_SLEEPCSR_KSO |
++		    BWFM_SDIO_FUNC1_SLEEPCSR_DEVON)) ==
++		    (BWFM_SDIO_FUNC1_SLEEPCSR_KSO |
++		    BWFM_SDIO_FUNC1_SLEEPCSR_DEVON))
++			break;
++		if (getsbinuptime() > deadline)
++			break;
+ 	}
++	DPRINTF(("%s: KSO %#x after %d tries\n", DEVNAME(&sc->sc_sc), v,
++	    tries));
++	sc->sc_bus_err = 0;
+ }
+ 
++/* Chip bring-up up to (not including) the firmware download. */
+ static int
+-bwfm_sdio_attach(device_t dev)
++bwfm_sdio_hw_attach(struct bwfm_sdio_softc *sc)
+ {
+-	struct bwfm_sdio_softc *sc = device_get_softc(dev);
+ 	struct bwfm_softc *bwfm = &sc->sc_sc;
++	device_t dev = bwfm->sc_dev;
+ 	struct bwfm_core *core;
+ 	uint32_t reg;
+ 	int error;
+ 
+-	bwfm->sc_dev = dev;
+-	sc->sc_bus = device_get_parent(dev);
+-	sc->sc_f1 = sdio_get_function(dev);
+-	sc->sc_f2 = bwfm_sdio_sibling(dev, 2);
+-	if (sc->sc_f1 == NULL || sc->sc_f2 == NULL) {
+-		device_printf(dev, "SDIO function 2 not found\n");
+-		return (ENXIO);
+-	}
+-
+-	sx_init(&sc->sc_lock, "bwfm sdio");
+-	mtx_init(&sc->sc_txq_mtx, "bwfm txq", NULL, MTX_DEF);
+-	mbufq_init(&sc->sc_tx_queue, 1024);
+-	sc->sc_bounce_size = 64 * 1024;
+-	sc->sc_bounce_buf = contigmalloc(sc->sc_bounce_size, M_BWFM,
+-	    M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+-	sc->sc_tx_seq = 0xff;
+-	sc->sc_tq = taskqueue_create("bwfm_sdio", M_WAITOK,
+-	    taskqueue_thread_enqueue, &sc->sc_tq);
+-	taskqueue_start_threads(&sc->sc_tq, 1, PI_NET, "%s sdio",
+-	    device_get_nameunit(dev));
+-	TASK_INIT(&sc->sc_task, 0, bwfm_sdio_task, sc);
+-	TIMEOUT_TASK_INIT(sc->sc_tq, &sc->sc_poll, 0, bwfm_sdio_poll, sc);
+-	TASK_INIT(&sc->sc_attach_task, 0, bwfm_sdio_attach_task, sc);
+-
+-	bwfm_attach(bwfm);
+-
+ 	sx_xlock(&sc->sc_lock);
+ 	error = sdio_set_block_size(sc->sc_f1, 64);
+ 	if (error == 0)
+@@ -453,6 +515,8 @@ bwfm_sdio_attach(device_t dev)
+ 		goto err;
+ 	}
+ 
++	bwfm_sdio_quiesce(sc);
++
+ 	DPRINTF(("%s: F1 signature read @0x18000000=%x\n", DEVNAME(bwfm),
+ 	    bwfm_sdio_read_4(sc, 0x18000000)));
+ 
+@@ -462,18 +526,18 @@ bwfm_sdio_attach(device_t dev)
+ 	    BWFM_SDIO_FUNC1_CHIPCLKCSR_ALP_AVAIL_REQ);
+ 
+ 	bwfm->sc_buscore_ops = &bwfm_sdio_buscore_ops;
+-	if (bwfm_chip_attach(bwfm) != 0) {
++	if (bwfm_chip_attach(bwfm) != 0 || sc->sc_dead) {
+ 		device_printf(dev, "cannot attach chip\n");
+ 		goto err;
+ 	}
+ 
+ 	sc->sc_cc = bwfm_chip_get_core(bwfm, BWFM_AGENT_CORE_CHIPCOMMON);
+-	if (sc->sc_cc == NULL) {
+-		device_printf(dev, "cannot find chipcommon core\n");
++	core = bwfm_chip_get_core(bwfm, BWFM_AGENT_CORE_SDIO_DEV);
++	if (sc->sc_cc == NULL || core == NULL) {
++		device_printf(dev, "cannot find chipcommon/SDIO cores\n");
+ 		goto err;
+ 	}
+ 
+-	core = bwfm_chip_get_core(bwfm, BWFM_AGENT_CORE_SDIO_DEV);
+ 	if (core->co_rev >= 12) {
+ 		reg = bwfm_sdio_read_1(sc, BWFM_SDIO_FUNC1_SLEEPCSR);
+ 		if (!(reg & BWFM_SDIO_FUNC1_SLEEPCSR_KSO)) {
+@@ -498,6 +562,8 @@ bwfm_sdio_attach(device_t dev)
+ 
+ 	bwfm_sdio_write_1(sc, BWFM_SDIO_FUNC1_CHIPCLKCSR, 0);
+ 	sc->sc_clkstate = CLK_SDONLY;
++	if (sc->sc_dead)
++		goto err;
+ 	sx_xunlock(&sc->sc_lock);
+ 
+ 	device_printf(dev, "chip %s rev %u, RAM %u KB at %#x\n",
+@@ -506,33 +572,117 @@ bwfm_sdio_attach(device_t dev)
+ 
+ 	bwfm->sc_bus_ops = &bwfm_sdio_bus_ops;
+ 	bwfm->sc_proto_ops = &bwfm_proto_bcdc_ops;
+-
+-	/*
+-	 * Loading the firmware needs the root file system.  When it is
+-	 * there (kldload, rc.d kld_list) finish now: the com then exists
+-	 * when attach returns, so devd's wifi attach rule (pccard_ether
+-	 * startchildren) and rc.d/netif (wlans_bwfm0) can create vaps.
+-	 * Otherwise (loaded by the loader) finish from a task once root is
+-	 * mounted; use kld_list="if_bwfm" for configuration at boot.
+-	 */
+-	if (rootvnode != NULL) {
+-		if (bwfm_sdio_preinit(bwfm) != 0 || bwfm_preinit(bwfm) != 0)
+-			device_printf(dev, "firmware start failed\n");
+-	} else
+-		taskqueue_enqueue(bwfm->sc_tq, &sc->sc_attach_task);
+ 	return (0);
+ 
+ err:
+ 	sx_xunlock(&sc->sc_lock);
+-	bwfm_detach(bwfm);
+-	bwfm_free(bwfm);
+-	taskqueue_free(sc->sc_tq);
+-	contigfree(sc->sc_bounce_buf, sc->sc_bounce_size, M_BWFM);
+-	mtx_destroy(&sc->sc_txq_mtx);
+-	sx_destroy(&sc->sc_lock);
+ 	return (ENXIO);
+ }
+ 
++/*
++ * Everything that talks to the chip runs here, off the attach path, so a
++ * card that does not answer can never hold up the boot.  attach waits
++ * for it a bounded time (hw.bwfm.attach_wait) so that the com normally
++ * exists when kldload / rc.d kld return and rc.d/netif creates the vaps;
++ * if it finishes later, devd gets a WIFI ATTACH event instead (devd.conf
++ * runs "pccard_ether bwfmN startchildren" for it).
++ */
++static void
++bwfm_sdio_attach_task(void *arg, int pending __unused)
++{
++	struct bwfm_sdio_softc *sc = arg;
++	struct bwfm_softc *bwfm = &sc->sc_sc;
++	sbintime_t t0, t1, t2;
++	int error, i, late;
++
++	/* Firmware files live on the root file system. */
++	for (i = 0; rootvnode == NULL && i < 300; i++)
++		pause("bwfmroot", hz);
++
++	t0 = getsbinuptime();
++	error = bwfm_sdio_hw_attach(sc);
++	t1 = getsbinuptime();
++	if (error == 0 && bwfm_sdio_preinit(bwfm) != 0)
++		error = EIO;
++	t2 = getsbinuptime();
++	if (error == 0 && bwfm_preinit(bwfm) != 0)
++		error = EIO;
++	device_printf(bwfm->sc_dev, "bring-up: chip %d ms, firmware load %d "
++	    "ms, init %d ms\n", (int)((t1 - t0) / SBT_1MS),
++	    (int)((t2 - t1) / SBT_1MS),
++	    (int)((getsbinuptime() - t2) / SBT_1MS));
++	if (error != 0)
++		device_printf(bwfm->sc_dev, "WiFi not started%s\n",
++		    sc->sc_dead ? " (card not responding)" : "");
++
++	BWFM_LOCK(bwfm);
++	sc->sc_attach_state = error ? BWFM_SDIO_ATT_FAILED :
++	    BWFM_SDIO_ATT_DONE;
++	late = !sc->sc_attach_waiting;
++	wakeup(&sc->sc_attach_state);
++	BWFM_UNLOCK(bwfm);
++
++	if (error == 0 && late) {
++		device_printf(bwfm->sc_dev, "firmware up\n");
++		devctl_notify("WIFI", device_get_nameunit(bwfm->sc_dev),
++		    "ATTACH", NULL);
++	}
++}
++
++static int
++bwfm_sdio_attach(device_t dev)
++{
++	struct bwfm_sdio_softc *sc = device_get_softc(dev);
++	struct bwfm_softc *bwfm = &sc->sc_sc;
++	sbintime_t deadline, now;
++	int late;
++
++	bwfm->sc_dev = dev;
++	sc->sc_bus = device_get_parent(dev);
++	sc->sc_f1 = sdio_get_function(dev);
++	sc->sc_f2 = bwfm_sdio_sibling(dev, 2);
++	if (sc->sc_f1 == NULL || sc->sc_f2 == NULL) {
++		device_printf(dev, "SDIO function 2 not found\n");
++		return (ENXIO);
++	}
++
++	sx_init(&sc->sc_lock, "bwfm sdio");
++	mtx_init(&sc->sc_txq_mtx, "bwfm txq", NULL, MTX_DEF);
++	mbufq_init(&sc->sc_tx_queue, 1024);
++	sc->sc_bounce_size = 64 * 1024;
++	sc->sc_bounce_buf = contigmalloc(sc->sc_bounce_size, M_BWFM,
++	    M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
++	sc->sc_tx_seq = 0xff;
++	sc->sc_tq = taskqueue_create("bwfm_sdio", M_WAITOK,
++	    taskqueue_thread_enqueue, &sc->sc_tq);
++	taskqueue_start_threads(&sc->sc_tq, 1, PI_NET, "%s sdio",
++	    device_get_nameunit(dev));
++	TASK_INIT(&sc->sc_task, 0, bwfm_sdio_task, sc);
++	TIMEOUT_TASK_INIT(sc->sc_tq, &sc->sc_poll, 0, bwfm_sdio_poll, sc);
++	TASK_INIT(&sc->sc_attach_task, 0, bwfm_sdio_attach_task, sc);
++
++	bwfm_attach(bwfm);
++
++	sc->sc_attach_state = BWFM_SDIO_ATT_PENDING;
++	sc->sc_attach_waiting = 1;
++	taskqueue_enqueue(bwfm->sc_tq, &sc->sc_attach_task);
++
++	BWFM_LOCK(bwfm);
++	deadline = getsbinuptime() + (sbintime_t)bwfm_sdio_attach_wait *
++	    SBT_1S;
++	while (sc->sc_attach_state == BWFM_SDIO_ATT_PENDING &&
++	    rootvnode != NULL && (now = getsbinuptime()) < deadline)
++		(void) msleep_sbt(&sc->sc_attach_state, &bwfm->sc_mtx, 0,
++		    "bwfmatt", deadline - now, 0, 0);
++	late = (sc->sc_attach_state == BWFM_SDIO_ATT_PENDING);
++	sc->sc_attach_waiting = 0;
++	BWFM_UNLOCK(bwfm);
++	if (late && rootvnode != NULL)
++		device_printf(dev, "firmware still starting after %d s, "
++		    "not holding up the boot\n", bwfm_sdio_attach_wait);
++	return (0);
++}
++
+ static int
+ bwfm_sdio_detach(device_t dev)
+ {
+@@ -554,9 +704,11 @@ bwfm_sdio_detach(device_t dev)
+ 	if (sc->sc_initialized) {
+ 		bwfm_sdio_write_1(sc, BWFM_SDIO_CCCR_INT_ENABLE, 0);
+ 		bwfm_sdio_clkctl(sc, CLK_NONE, 0);
+-		sdio_disable_func(sc->sc_f2);
++		if (!sc->sc_dead)
++			sdio_disable_func(sc->sc_f2);
+ 	}
+-	sdio_disable_func(sc->sc_f1);
++	if (!sc->sc_dead)
++		sdio_disable_func(sc->sc_f1);
+ 	sx_xunlock(&sc->sc_lock);
+ 
+ 	mbufq_drain(&sc->sc_tx_queue);
+@@ -579,6 +731,7 @@ bwfm_sdio_preinit(struct bwfm_softc *bwfm)
+ 	uint32_t clk, reg;
+ 	u_char *ucode, *nvram;
+ 	size_t size = 0, nvsize, nvlen = 0;
++	sbintime_t t0, t1;
+ 
+ 	if (sc->sc_initialized)
+ 		return 0;
+@@ -640,9 +793,11 @@ bwfm_sdio_preinit(struct bwfm_softc *bwfm)
+ 		goto err;
+ 	}
+ 
++	t0 = getsbinuptime();
+ 	if (bwfm_loadfirmware(bwfm, chip, "-sdio", &ucode, &size,
+ 	    &nvram, &nvsize, &nvlen) != 0)
+ 		goto err;
++	t1 = getsbinuptime();
+ 
+ 	sc->sc_alp_only = 1;
+ 	if (bwfm_sdio_load_microcode(sc, ucode, size,
+@@ -656,6 +811,9 @@ bwfm_sdio_preinit(struct bwfm_softc *bwfm)
+ 	sc->sc_alp_only = 0;
+ 	free(ucode, M_BWFM);
+ 	free(nvram, M_BWFM);
++	device_printf(bwfm->sc_dev, "firmware files %d ms, download %d ms "
++	    "(%zu bytes)\n", (int)((t1 - t0) / SBT_1MS),
++	    (int)((getsbinuptime() - t1) / SBT_1MS), size);
+ 
+ 	bwfm_sdio_clkctl(sc, CLK_AVAIL, 0);
+ 	if (sc->sc_clkstate != CLK_AVAIL)
+@@ -716,7 +874,7 @@ bwfm_sdio_poll(void *arg, int pending __unused)
+ 	uint8_t pend;
+ 	bool work;
+ 
+-	if (!sc->sc_poll_on)
++	if (!sc->sc_poll_on || sc->sc_dead)
+ 		return;
+ 	pend = 0;
+ 	(void) SDIO_READ_DIRECT(sc->sc_bus, 0, BWFM_SDIO_CCCR_INT_PENDING,
+@@ -882,9 +1040,14 @@ bwfm_sdio_load_microcode(struct bwfm_sdio_softc *sc, u_char *ucode, size_t size,
+ {
+ 	struct bwfm_softc *bwfm = (void *)sc;
+ 	char *verify = NULL;
++	size_t vlen;
+ 	int err = 0;
+ 
+ 	bwfm_sdio_clkctl(sc, CLK_AVAIL, 0);
++	if (sc->sc_clkstate != CLK_AVAIL) {
++		err = EIO;
++		goto out;
++	}
+ 
+ 	/* Upload firmware */
+ 	err = bwfm_sdio_ram_read_write(sc, bwfm->sc_chip.ch_rambase,
+@@ -892,14 +1055,22 @@ bwfm_sdio_load_microcode(struct bwfm_sdio_softc *sc, u_char *ucode, size_t size,
+ 	if (err)
+ 		goto out;
+ 
+-	/* Verify firmware */
+-	verify = malloc(size, M_BWFM, M_WAITOK | M_ZERO);
++	/*
++	 * Verify firmware.  Reading the whole image back doubles the
++	 * download time on a slow SDIO bus, so by default only its first
++	 * 4 KB are compared (this catches window/address mistakes);
++	 * hw.bwfm.verify_fw=1 compares everything.
++	 */
++	vlen = bwfm_sdio_verify_fw ? size : MIN(size, 4096);
++	verify = malloc(vlen, M_BWFM, M_WAITOK | M_ZERO);
+ 	err = bwfm_sdio_ram_read_write(sc, bwfm->sc_chip.ch_rambase,
+-	    verify, size, 0);
+-	if (err || memcmp(verify, ucode, size)) {
++	    verify, vlen, 0);
++	if (err || memcmp(verify, ucode, vlen)) {
+ 		printf("%s: firmware verification failed\n",
+ 		    DEVNAME(&sc->sc_sc));
+ 		free(verify, M_BWFM);
++		if (err == 0)
++			err = EIO;
+ 		goto out;
+ 	}
+ 	free(verify, M_BWFM);
+@@ -918,6 +1089,8 @@ bwfm_sdio_load_microcode(struct bwfm_sdio_softc *sc, u_char *ucode, size_t size,
+ 		printf("%s: nvram verification failed\n",
+ 		    DEVNAME(&sc->sc_sc));
+ 		free(verify, M_BWFM);
++		if (err == 0)
++			err = EIO;
+ 		goto out;
+ 	}
+ 	free(verify, M_BWFM);
+@@ -972,6 +1145,7 @@ void
+ bwfm_sdio_htclk(struct bwfm_sdio_softc *sc, int on, int pendok)
+ {
+ 	uint32_t clkctl, devctl, req;
++	sbintime_t deadline;
+ 	int i;
+ 
+ 	if (sc->sc_sr_enabled) {
+@@ -1003,15 +1177,22 @@ bwfm_sdio_htclk(struct bwfm_sdio_softc *sc, int on, int pendok)
+ 			bwfm_sdio_write_1(sc, BWFM_SDIO_DEVICE_CTL, devctl);
+ 		}
+ 
+-		for (i = 0; i < 5000; i++) {
++		/* At most 5 s, however slow each register read is. */
++		deadline = getsbinuptime() + 5 * SBT_1S;
++		for (i = 0; i < 5000 && !sc->sc_dead; i++) {
+ 			if (BWFM_SDIO_FUNC1_CHIPCLKCSR_CLKAV(clkctl,
+-			    sc->sc_alp_only))
++			    sc->sc_alp_only) && clkctl != 0xff)
++				break;
++			if (getsbinuptime() > deadline)
+ 				break;
+ 			clkctl = bwfm_sdio_read_1(sc, BWFM_SDIO_FUNC1_CHIPCLKCSR);
+ 			DELAY(1000);
+ 		}
+-		if (!BWFM_SDIO_FUNC1_CHIPCLKCSR_CLKAV(clkctl, sc->sc_alp_only)) {
+-			printf("%s: HT avail timeout\n", DEVNAME(&sc->sc_sc));
++		if (!BWFM_SDIO_FUNC1_CHIPCLKCSR_CLKAV(clkctl, sc->sc_alp_only) ||
++		    clkctl == 0xff) {
++			printf("%s: %s clock not available (%#x)\n",
++			    DEVNAME(&sc->sc_sc), sc->sc_alp_only ? "ALP" : "HT",
++			    clkctl);
+ 			return;
+ 		}
+ 
+@@ -1166,6 +1347,7 @@ bwfm_sdio_buscore_prepare(struct bwfm_softc *bwfm)
+ {
+ 	struct bwfm_sdio_softc *sc = (void *)bwfm;
+ 	uint8_t clkval, clkset, clkmask;
++	sbintime_t deadline;
+ 	int i;
+ 
+ 	clkset = BWFM_SDIO_FUNC1_CHIPCLKCSR_ALP_AVAIL_REQ |
+@@ -1182,13 +1364,18 @@ bwfm_sdio_buscore_prepare(struct bwfm_softc *bwfm)
+ 		return 1;
+ 	}
+ 
+-	for (i = 1000; i > 0; i--) {
++	deadline = getsbinuptime() + SBT_1S;
++	for (i = 1000; i > 0 && !sc->sc_dead; i--) {
+ 		clkval = bwfm_sdio_read_1(sc,
+ 		    BWFM_SDIO_FUNC1_CHIPCLKCSR);
+-		if (clkval & clkmask)
++		if ((clkval & clkmask) && clkval != 0xff)
+ 			break;
++		if (getsbinuptime() > deadline) {
++			i = 0;
++			break;
++		}
+ 	}
+-	if (i == 0) {
++	if (i == 0 || sc->sc_dead) {
+ 		printf("%s: timeout on ALPAV wait, clkval 0x%02x\n",
+ 		    DEVNAME(&sc->sc_sc), clkval);
+ 		return 1;
+-- 
+2.55.0
+

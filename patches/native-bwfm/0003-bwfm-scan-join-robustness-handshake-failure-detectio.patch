@@ -1,7 +1,7 @@
 From fa8c76708af7f20152acc27ae8a24db14c088e5b Mon Sep 17 00:00:00 2001
 From: Andrey Bodrov <ap.bodrov@gmail.com>
 Date: Sun, 11 Oct 2026 23:10:57 +0300
-Subject: [PATCH 3/3] bwfm: scan/join robustness, handshake failure detection;
+Subject: [PATCH 3/5] bwfm: scan/join robustness, handshake failure detection;
  devd: bwfm is a wifi driver
 
 - end a firmware scan from a timeout instead of immediately when the

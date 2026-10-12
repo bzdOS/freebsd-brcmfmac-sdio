@@ -57,10 +57,14 @@ ifconfig_wlan0="ssid MyNetwork wpakey MyPassphrase DHCP"   # no spaces in rc.con
 | `0001` | OpenBSD `bwfm.c`, `bwfmreg.h`, `bwfmvar.h`, `if_bwfm_sdio.[ch]` imported unmodified (openbsd/src f3dc682c, 2026-10-11). |
 | `0002` | The FreeBSD port: newbus attachment to `sdiob(4)`, polled card interrupt, firmware(9), net80211 glue (scan offload, firmware join, 802.3 data path); `IEEE80211_IOC_WPAPSK` in net80211 (PSK stored in the vap, taken from `iv_spare`, ABI unchanged); `ifconfig wpakey`/`-wpakey` (PBKDF2 in userland). |
 | `0003` | Robustness fixes found on hardware; `bwfm` added to devd's WiFi driver list. |
+| `0004` | Access point mode (`wlanmode hostap`, WPA2-PSK/CCMP with the firmware authenticator); `ifconfig wpakey` applied immediately so an AP never comes up open. The BSS starts and stations associate; a full WPA2 client handshake through the firmware authenticator is not confirmed yet. |
+| `0005` | The boot never waits on WiFi: chip bring-up and firmware download run in a task (attach waits at most `hw.bwfm.attach_wait`, 10 s), every bus wait is bounded, a card that stops answering is declared dead instead of being polled for minutes, and a chip left running by a warm reset is quiesced and woken first. Verified over six warm reboots and forced guest panics with the firmware running. |
 
 Proven on the board: attach and firmware boot, scan, WPA2-PSK join through
 the firmware supplicant, DHCP, ping over wlan0, down/up reconnect, wrong-key
 detection, and the rc.conf path (devd -> `wlans_bwfm0` -> `ifconfig_wlan0`).
+Firmware download takes about 18 s, because the MMCCAM SDIO bus stays at its
+enumeration clock; the boot is not held up by it.
 Not yet: the host-supplicant path (`wpa_supplicant -D bsd` gets message 1 of
 the handshake but the access point never accepts message 2), hostap mode.
 
