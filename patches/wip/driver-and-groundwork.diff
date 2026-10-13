@@ -95,7 +95,7 @@ index fb4554a8d..80d05cdb0 100644
   *
 - * Copyright (c) 2023 Serenity Cyber Security, LLC.
 + * linuxkpi OF (device-tree) stubs for FreeBSD.
-+ * Part of the planck-113 SDIO LinuxKPI port.
++ * Part of the SDIO LinuxKPI port.
   *
 - * Redistribution and use in source and binary forms, with or without
 - * modification, are permitted provided that the following conditions
@@ -226,7 +226,7 @@ index e69de29bb..ebcc4ed51 100644
 + * SPDX-License-Identifier: BSD-2-Clause
 + *
 + * linuxkpi OF IRQ stubs for FreeBSD.
-+ * Part of the planck-113 SDIO LinuxKPI port.
++ * Part of the SDIO LinuxKPI port.
 + */
 +#ifndef _LINUXKPI_DUMMY_OF_IRQ_H
 +#define _LINUXKPI_DUMMY_OF_IRQ_H

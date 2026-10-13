@@ -1,7 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * linuxkpi SDIO bridge (planck-113): _bsd-suffixed forwarders over the
+ * linuxkpi SDIO bridge: _bsd-suffixed forwarders over the
  * kernel-exported native dev/sdio helpers.
  *
  * linux_mmc.c renames the native API to <name>_bsd before including

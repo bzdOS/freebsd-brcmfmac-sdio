@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: BSD-2-Clause
  * linuxkpi clock API stub for FreeBSD.
- * Part of the planck-113 SDIO LinuxKPI port.
+ * Part of the SDIO LinuxKPI port.
  */
 #ifndef _LINUXKPI_LINUX_CLK_H
 #define _LINUXKPI_LINUX_CLK_H
